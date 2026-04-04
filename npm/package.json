@@ -1,0 +1,24 @@
+{
+  "name": "mcp-apply-patch",
+  "version": "1.0.0",
+  "description": "MCP server for structured file patching using V4A diffs. Create, update, and delete files in one atomic operation.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tuanhung303/apply-patch-mcp"
+  },
+  "bin": {
+    "mcp-apply-patch": "bin/run.js"
+  },
+  "files": [
+    "bin/",
+    "scripts/",
+    "README.md"
+  ],
+  "scripts": {},
+  "os": ["darwin", "linux", "win32"],
+  "cpu": ["x64", "arm64"],
+  "engines": {
+    "node": ">=16"
+  }
+}

@@ -1,0 +1,7 @@
+/target
+
+# npm wrapper
+npm/node_modules/
+npm/bin/apply-patch-mcp
+npm/bin/apply-patch-mcp.exe
+npm/*.tgz
