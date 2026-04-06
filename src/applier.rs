@@ -966,20 +966,71 @@ fn find_matches(file_lines: &[String], pattern: &[&str]) -> Vec<usize> {
     positions
 }
 
+/// Check if hint ends with `$` for word-boundary matching.
+/// Returns (stripped_hint, is_word_boundary).
+fn word_boundary_match(hint: &str) -> (&str, bool) {
+    if hint.ends_with('$') {
+        (&hint[..hint.len()-1], true)
+    } else {
+        (hint, false)
+    }
+}
+
+/// Check if a line contains the hint at a word boundary.
+/// Word boundary means the hint is followed by non-word characters (end of line, space, punctuation, etc).
+fn hint_matches_at_word_boundary(line: &str, hint: &str) -> bool {
+    if let Some(pos) = line.find(hint) {
+        let after_hint = &line[pos + hint.len()..];
+        // Word boundary: end of string or followed by non-alphanumeric/underscore
+        after_hint.is_empty() || !after_hint.chars().next().unwrap().is_alphanumeric() && after_hint.chars().next().unwrap() != '_'
+    } else {
+        false
+    }
+}
+
 fn find_with_hint(file_lines: &[String], pattern: &[&str], hint: &str) -> Option<usize> {
+    // Check for word-boundary matching (hint ends with $)
+    let (stripped_hint, is_word_boundary) = word_boundary_match(hint);
+    
+    // Find lines containing the hint
     let hint_positions: Vec<usize> = file_lines
         .iter()
         .enumerate()
-        .filter(|(_, l)| l.contains(hint))
+        .filter(|(_, l)| {
+            if is_word_boundary {
+                // Word-boundary matching: hint must be followed by non-word char
+                hint_matches_at_word_boundary(l, stripped_hint)
+            } else {
+                // Normal matching: any containment
+                l.contains(stripped_hint)
+            }
+        })
         .map(|(i, _)| i)
         .collect();
 
     if hint_positions.is_empty() {
-        let hint_lower = hint.to_lowercase();
+        // Try case-insensitive matching
+        let hint_lower = stripped_hint.to_lowercase();
         let hint_positions: Vec<usize> = file_lines
             .iter()
             .enumerate()
-            .filter(|(_, l)| l.to_lowercase().contains(&hint_lower))
+            .filter(|(_, l)| {
+                let line_lower = l.to_lowercase();
+                if is_word_boundary {
+                    // For case-insensitive word boundary, check each position
+                    if let Some(pos) = line_lower.find(&hint_lower) {
+                        let after_hint = &line_lower[pos + hint_lower.len()..];
+                        after_hint.is_empty() || {
+                            let next_char = after_hint.chars().next().unwrap();
+                            !next_char.is_alphanumeric() && next_char != '_'
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    line_lower.contains(&hint_lower)
+                }
+            })
             .map(|(i, _)| i)
             .collect();
 
