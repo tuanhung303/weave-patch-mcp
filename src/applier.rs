@@ -1,5 +1,8 @@
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+use rayon::prelude::*;
 
 use crate::error::{ClosestMatch, ContextNotFoundData, PatchError};
 use crate::parser::{DiffLine, FileOp, Hunk};
@@ -44,43 +47,49 @@ fn make_op(path: &str, op_type: &str, status: &str, message: &str) -> OpResult {
 
 /// Two-phase commit: stages shadow files, commits atomically, rolls back on Drop if not committed.
 struct PatchTransaction {
-    staged_files: Vec<(PathBuf, PathBuf)>, // (shadow_path, target_path)
-    deletions: Vec<PathBuf>,
-    committed: bool,
-    backup_files: Vec<(PathBuf, PathBuf)>, // (backup_path, target_path)
+    staged_files: Arc<Mutex<Vec<(PathBuf, PathBuf)>>>, // (shadow_path, target_path)
+    deletions: Arc<Mutex<Vec<PathBuf>>>,
+    committed: Arc<Mutex<bool>>,
+    backup_files: Arc<Mutex<Vec<(PathBuf, PathBuf)>>>, // (backup_path, target_path)
 }
 
 impl PatchTransaction {
     fn new() -> Self {
         Self {
-            staged_files: Vec::new(),
-            deletions: Vec::new(),
-            committed: false,
-            backup_files: Vec::new(),
+            staged_files: Arc::new(Mutex::new(Vec::new())),
+            deletions: Arc::new(Mutex::new(Vec::new())),
+            committed: Arc::new(Mutex::new(false)),
+            backup_files: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    fn stage(&mut self, shadow: PathBuf, target: PathBuf) {
-        self.staged_files.push((shadow, target));
+    fn stage(&self, shadow: PathBuf, target: PathBuf) {
+        self.staged_files.lock().push((shadow, target));
     }
 
-    fn queue_deletion(&mut self, path: PathBuf) {
-        self.deletions.push(path);
+    fn queue_deletion(&self, path: PathBuf) {
+        self.deletions.lock().push(path);
     }
 
-    fn commit(mut self) -> Result<(), std::io::Error> {
+    fn commit(self) -> Result<(), std::io::Error> {
+        // Lock all the mutexes once at the start
+        let staged = self.staged_files.lock();
+        let deletions = self.deletions.lock();
+        let mut committed = self.committed.lock();
+        let mut backup_files = self.backup_files.lock();
+
         // Phase 1: Backup existing targets before rename so we can rollback on partial failure
-        for (_, target) in &self.staged_files {
+        for (_, target) in &*staged {
             if target.exists() {
                 let backup = backup_path_for(target);
                 std::fs::copy(target, &backup)?;
-                self.backup_files.push((backup, target.clone()));
+                backup_files.push((backup, target.clone()));
             }
         }
 
         // Phase 2: Rename shadows → targets; rollback on any failure
         let mut renamed: Vec<PathBuf> = Vec::new();
-        for (shadow, target) in &self.staged_files {
+        for (shadow, target) in &*staged {
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -88,19 +97,19 @@ impl PatchTransaction {
                 // Restore already-renamed targets from backup
                 for done_target in &renamed {
                     if let Some((backup, _)) =
-                        self.backup_files.iter().find(|(_, t)| t == done_target)
+                        backup_files.iter().find(|(_, t)| t == done_target)
                     {
                         let _ = std::fs::rename(backup, done_target);
                     }
                 }
                 // Clean up remaining shadow files
-                for (s, t) in &self.staged_files {
+                for (s, t) in &*staged {
                     if !renamed.contains(t) {
                         let _ = std::fs::remove_file(s);
                     }
                 }
                 // Clean up all backup files
-                for (backup, _) in &self.backup_files {
+                for (backup, _) in &*backup_files {
                     let _ = std::fs::remove_file(backup);
                 }
                 return Err(e);
@@ -109,25 +118,28 @@ impl PatchTransaction {
         }
 
         // Phase 3: Success — execute deletions and clean up backup files
-        for (backup, _) in &self.backup_files {
+        for (backup, _) in &*backup_files {
             let _ = std::fs::remove_file(backup);
         }
-        for path in &self.deletions {
+        for path in &*deletions {
             std::fs::remove_file(path)?;
         }
-        self.committed = true;
+        *committed = true;
         Ok(())
     }
 }
 
 impl Drop for PatchTransaction {
     fn drop(&mut self) {
-        if !self.committed {
-            for (shadow, _) in &self.staged_files {
+        let committed = *self.committed.lock();
+        if !committed {
+            let staged = self.staged_files.lock();
+            for (shadow, _) in &*staged {
                 let _ = std::fs::remove_file(shadow);
             }
             // Clean up any leftover backup files
-            for (backup, _) in &self.backup_files {
+            let backup_files = self.backup_files.lock();
+            for (backup, _) in &*backup_files {
                 let _ = std::fs::remove_file(backup);
             }
         }
@@ -140,27 +152,110 @@ fn backup_path_for(path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-fn shadow_suffix() -> u32 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos()
+fn shadow_suffix() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// Detect file conflicts: Add+Update on same path is an error.
+/// Returns a map of path -> list of operation types for conflict reporting.
+fn detect_file_conflicts(ops: &[FileOp]) -> Result<(), (String, String)> {
+    use std::collections::HashMap;
+    let mut path_ops: HashMap<String, Vec<&str>> = HashMap::new();
+    
+    for op in ops {
+        let (path, op_type) = match op {
+            FileOp::Add { path, .. } => (path.as_str(), "add"),
+            FileOp::Update { path, .. } => (path.as_str(), "update"),
+            FileOp::Delete { path } => (path.as_str(), "delete"),
+            FileOp::Read { path, .. } => (path.as_str(), "read"),
+            FileOp::Map { .. } => continue,
+        };
+        path_ops.entry(path.to_string()).or_default().push(op_type);
+    }
+    
+    // Check for Add+Update conflict on same path
+    for (path, ops_list) in &path_ops {
+        let has_add = ops_list.iter().any(|&t| t == "add");
+        let has_update = ops_list.iter().any(|&t| t == "update");
+        if has_add && has_update {
+            return Err((path.clone(), "Cannot Add and Update the same file in one patch".to_string()));
+        }
+    }
+    
+    Ok(())
+}
+
+/// Group operations by target file path for parallel processing.
+/// Returns a vector of (path, vector of operation indices).
+#[allow(dead_code)]
+fn group_ops_by_file(ops: &[FileOp]) -> Vec<(String, Vec<usize>)> {
+    use std::collections::HashMap;
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+    
+    for (idx, op) in ops.iter().enumerate() {
+        let path = match op {
+            FileOp::Add { path, .. } => path.clone(),
+            FileOp::Update { path, .. } => path.clone(),
+            FileOp::Delete { path } => path.clone(),
+            FileOp::Read { path, .. } => path.clone(),
+            FileOp::Map { .. } => continue,
+        };
+        groups.entry(path).or_default().push(idx);
+    }
+    
+    groups.into_iter().collect()
 }
 
 #[must_use]
 pub fn apply_patch(ops: Vec<FileOp>, base_dir: &Path) -> PatchResult {
-    let mut results: Vec<OpResult> = Vec::new();
-    let mut transaction = PatchTransaction::new();
-    let mut failed = false;
-
-    // Prepare phase: validate and stage all ops
-    for op in ops {
-        let result = prepare_op(op, base_dir, &mut transaction);
-        if result.status == "error" {
-            failed = true;
-        }
-        results.push(result);
+    // Step 1: Detect conflicts before any I/O
+    if let Err((path, msg)) = detect_file_conflicts(&ops) {
+        // Return error for the conflicting operation
+        let results: Vec<OpResult> = ops.iter().map(|op| {
+            let op_type = match op {
+                FileOp::Add { .. } => "add",
+                FileOp::Update { .. } => "update",
+                FileOp::Delete { .. } => "delete",
+                FileOp::Read { .. } => "read",
+                FileOp::Map { .. } => "map",
+            };
+            let op_path = match op {
+                FileOp::Add { path, .. } => path,
+                FileOp::Update { path, .. } => path,
+                FileOp::Delete { path } => path,
+                FileOp::Read { path, .. } => path,
+                FileOp::Map { path, .. } => path,
+            };
+            if op_path == &path {
+                make_op(op_path, op_type, "error", &msg)
+            } else {
+                make_op(op_path, op_type, "skipped", "Skipped due to conflict")
+            }
+        }).collect();
+        return PatchResult { operations: results };
     }
+
+    let transaction = PatchTransaction::new();
+
+    // Step 2: Prepare phase - parallel execution using rayon
+    // We need to preserve operation order for results, so we collect with indices
+    let results: Vec<(usize, OpResult)> = ops
+        .into_iter()
+        .enumerate()
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .map(|(idx, op)| {
+            (idx, prepare_op(op, base_dir, &transaction))
+        })
+        .collect();
+
+    // Sort results by original index to preserve order
+    let mut results: Vec<OpResult> = results.into_iter()
+        .map(|(_, r)| r)
+        .collect();
+
+    // Check if any operation failed
+    let failed = results.iter().any(|r| r.status == "error");
 
     // If any op failed, Drop cleans up shadow files
     if failed {
@@ -169,7 +264,7 @@ pub fn apply_patch(ops: Vec<FileOp>, base_dir: &Path) -> PatchResult {
         };
     }
 
-    // Commit phase: rename shadows → targets, execute deletions
+    // Step 3: Commit phase - sequential for atomicity
     if let Err(e) = transaction.commit() {
         // Mark all "ok" ops as failed due to commit error
         let msg = format!("Commit failed: {e}");
@@ -187,7 +282,7 @@ pub fn apply_patch(ops: Vec<FileOp>, base_dir: &Path) -> PatchResult {
 }
 
 /// Validate and stage a single op. Returns OpResult with shadow file info.
-fn prepare_op(op: FileOp, base_dir: &Path, tx: &mut PatchTransaction) -> OpResult {
+fn prepare_op(op: FileOp, base_dir: &Path, tx: &PatchTransaction) -> OpResult {
     match op {
         FileOp::Add { path, content } => {
             let full_path = match validate_path(base_dir, &path) {
@@ -244,6 +339,7 @@ fn prepare_op(op: FileOp, base_dir: &Path, tx: &mut PatchTransaction) -> OpResul
                         // Re-target the staged shadow to move destination
                         if let Some(entry) = tx
                             .staged_files
+                            .lock()
                             .iter_mut()
                             .find(|(s, _)| *s == result.shadow_path)
                         {
@@ -334,7 +430,7 @@ pub fn check_symlink(path: &Path, display_path: &str) -> Result<(), PatchError> 
 }
 
 pub fn validate_path(base_dir: &Path, rel_path: &str) -> Result<PathBuf, PatchError> {
-    /// Security note: Path sandbox removed per user request.
+    // Security note: Path sandbox removed per user request.
     // Symlink protection is still enforced in check_symlink().
     // This allows patches to access any path the user has permission for.
     Ok(base_dir.join(rel_path))
@@ -351,7 +447,7 @@ struct StageAddResult {
 fn stage_add(
     path: &Path,
     content: &str,
-    tx: &mut PatchTransaction,
+    tx: &PatchTransaction,
 ) -> Result<StageAddResult, PatchError> {
     if path.exists() {
         return Err(PatchError::FileAlreadyExists(path.display().to_string()));
@@ -387,7 +483,7 @@ struct StageDeleteResult {
 fn stage_delete(
     path: &Path,
     display_path: &str,
-    tx: &mut PatchTransaction,
+    tx: &PatchTransaction,
 ) -> Result<StageDeleteResult, PatchError> {
     if !path.exists() {
         return Err(PatchError::FileNotFound(display_path.to_string()));
@@ -426,7 +522,7 @@ fn stage_update(
     path: &Path,
     display_path: &str,
     hunks: &[Hunk],
-    tx: &mut PatchTransaction,
+    tx: &PatchTransaction,
 ) -> Result<StageUpdateResult, PatchError> {
     if !path.exists() {
         return Err(PatchError::FileNotFound(display_path.to_string()));
