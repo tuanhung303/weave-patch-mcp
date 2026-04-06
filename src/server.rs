@@ -261,10 +261,15 @@ impl ApplyPatchServer {
                     }
                 }
 
-                // Append diff if available
+                // Append truncated diff preview (max 5 lines)
                 if let Some(ref diff) = op.diff {
-                    for diff_line in diff.lines() {
+                    let diff_lines: Vec<&str> = diff.lines().collect();
+                    for diff_line in diff_lines.iter().take(5) {
                         lines.push(format!("   {diff_line}"));
+                    }
+                    if diff_lines.len() > 5 {
+                        let remaining = diff_lines.len() - 5;
+                        lines.push(format!("   ... (+{remaining} more lines)"));
                     }
                 }
             }

@@ -14,9 +14,13 @@ pub struct OpResult {
     pub op_type: String,
     pub status: String,
     pub message: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub diff: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub line_changes: Option<(usize, usize)>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub match_info: Option<String>,
 }
 
