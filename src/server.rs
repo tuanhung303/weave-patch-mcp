@@ -190,23 +190,20 @@ impl ApplyPatchServer {
         let has_error = result.operations.iter().any(|op| op.status == "error");
 
         let patch_output = if has_error {
-            match serde_json::to_string_pretty(&result.operations) {
-                Ok(json) => json,
-                Err(_) => result
-                    .operations
-                    .iter()
-                    .map(|op| {
-                        format!(
-                            "[{}] {} \u{2014} {} ({})",
-                            op.status.to_uppercase(),
-                            op.op_type,
-                            op.path,
-                            op.message
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            }
+            result
+                .operations
+                .iter()
+                .filter(|op| op.status == "error")
+                .map(|op| {
+                    format!(
+                        "[ERROR] {} \u{2014} {}: {}",
+                        op.op_type,
+                        op.path,
+                        op.message
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
         } else {
             let mut lines: Vec<String> = Vec::new();
             for op in &result.operations {
