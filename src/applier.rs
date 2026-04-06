@@ -334,56 +334,10 @@ pub fn check_symlink(path: &Path, display_path: &str) -> Result<(), PatchError> 
 }
 
 pub fn validate_path(base_dir: &Path, rel_path: &str) -> Result<PathBuf, PatchError> {
-    // Reject absolute paths
-    if rel_path.starts_with('/') || rel_path.starts_with('\\') {
-        return Err(PatchError::PathTraversal(format!(
-            "absolute path rejected: {rel_path}"
-        )));
-    }
-
-    let joined = base_dir.join(rel_path);
-
-    // Canonicalize base_dir
-    let canonical_base = base_dir
-        .canonicalize()
-        .map_err(|e| PatchError::PathTraversal(format!("cannot canonicalize base_dir: {e}")))?;
-
-    // For containment check we canonicalize the nearest existing ancestor of the joined path.
-    let canonical_joined = canonicalize_best_effort(&joined)
-        .ok_or_else(|| PatchError::PathTraversal(format!("cannot resolve path: {rel_path}")))?;
-
-    if !canonical_joined.starts_with(&canonical_base) {
-        return Err(PatchError::PathTraversal(format!(
-            "path escapes base directory: {rel_path}"
-        )));
-    }
-
-    Ok(joined)
-}
-
-/// Walk up the path until we find an existing ancestor, canonicalize that,
-/// then re-append the remaining (non-existent) components.
-fn canonicalize_best_effort(path: &Path) -> Option<PathBuf> {
-    let mut components: Vec<std::ffi::OsString> = Vec::new();
-    let mut current = path.to_path_buf();
-
-    loop {
-        if current.exists() {
-            break;
-        }
-        let file_name = current.file_name()?.to_os_string();
-        components.push(file_name);
-        current = current.parent()?.to_path_buf();
-        if current == Path::new("") {
-            break;
-        }
-    }
-
-    let mut canonical = current.canonicalize().ok()?;
-    for component in components.into_iter().rev() {
-        canonical.push(component);
-    }
-    Some(canonical)
+    /// Security note: Path sandbox removed per user request.
+    // Symlink protection is still enforced in check_symlink().
+    // This allows patches to access any path the user has permission for.
+    Ok(base_dir.join(rel_path))
 }
 
 /// Result from stage_add
@@ -1299,55 +1253,68 @@ mod tests {
         assert!(!existing.exists());
     }
 
-    // F1: Path traversal rejection tests
+    // F1: Path traversal tests (sandbox removed, paths now allowed)
     #[test]
-    fn test_path_traversal_add_rejected() {
+    fn test_path_traversal_add_now_allowed() {
+        // Sandbox removed - paths can now escape base directory
         let dir = tmp();
         let ops = vec![FileOp::Add {
-            path: "../../etc/passwd".to_string(),
-            content: "evil\n".to_string(),
+            path: "../outside_file.txt".to_string(),
+            content: "content\n".to_string(),
         }];
         let result = apply_patch(ops, dir.path());
-        assert_eq!(result.operations[0].status, "error");
-        assert!(
-            result.operations[0].message.contains("traversal")
-                || result.operations[0].message.contains("escapes"),
-            "expected traversal error, got: {}",
-            result.operations[0].message
-        );
+        // Path is now allowed (will fail only if parent doesn't exist or permission denied)
+        // For this test, we create a sibling directory
+        let parent = dir.path().parent().unwrap();
+        let _ = fs::create_dir_all(parent);
+        // The operation should succeed or fail with a different error (not traversal)
+        if result.operations[0].status == "ok" {
+            // Successfully created file outside base dir
+            assert!(parent.join("outside_file.txt").exists());
+            // Cleanup
+            let _ = fs::remove_file(parent.join("outside_file.txt"));
+        } else {
+            // Should NOT be a traversal error
+            assert!(!result.operations[0].message.contains("traversal"));
+            assert!(!result.operations[0].message.contains("escapes"));
+        }
     }
 
     #[test]
-    fn test_path_traversal_delete_rejected() {
+    fn test_path_traversal_delete_now_allowed() {
+        // Sandbox removed - paths can now escape base directory
         let dir = tmp();
+        // Create a sibling file to delete
+        let parent = dir.path().parent().unwrap();
+        let sibling_file = parent.join("sibling_to_delete.txt");
+        fs::write(&sibling_file, "content").unwrap();
+        
         let ops = vec![FileOp::Delete {
-            path: "../sibling_dir/important_file".to_string(),
+            path: "../sibling_to_delete.txt".to_string(),
         }];
         let result = apply_patch(ops, dir.path());
-        assert_eq!(result.operations[0].status, "error");
-        assert!(
-            result.operations[0].message.contains("traversal")
-                || result.operations[0].message.contains("escapes"),
-            "expected traversal error, got: {}",
-            result.operations[0].message
-        );
+        // Should succeed in deleting the sibling file
+        assert_eq!(result.operations[0].status, "ok", "Expected ok, got: {}", result.operations[0].message);
+        assert!(!sibling_file.exists(), "Sibling file should be deleted");
     }
 
     #[test]
-    fn test_absolute_path_add_rejected() {
+    fn test_absolute_path_add_now_allowed() {
+        // Sandbox removed - absolute paths are now allowed
         let dir = tmp();
+        let unique_name = format!("/tmp/patch_test_{}.txt", std::process::id());
         let ops = vec![FileOp::Add {
-            path: "/tmp/evil.txt".to_string(),
-            content: "evil\n".to_string(),
+            path: unique_name.clone(),
+            content: "test content\n".to_string(),
         }];
         let result = apply_patch(ops, dir.path());
-        assert_eq!(result.operations[0].status, "error");
-        assert!(
-            result.operations[0].message.contains("absolute")
-                || result.operations[0].message.contains("traversal"),
-            "expected absolute path error, got: {}",
-            result.operations[0].message
-        );
+        // Should succeed (or fail with permission error, not traversal)
+        if result.operations[0].status == "ok" {
+            // Cleanup
+            let _ = fs::remove_file(&unique_name);
+        }
+        // Should NOT be an absolute path rejection error
+        assert!(!result.operations[0].message.contains("absolute path rejected"));
     }
 
     // F2: Symlink rejection test
@@ -1403,41 +1370,41 @@ mod tests {
         );
     }
 
-    // Adversarial: nested path traversal via foo/../../bar
+    // Nested path traversal - now allowed
     #[test]
-    fn test_nested_path_traversal_rejected() {
+    fn test_nested_path_traversal_now_allowed() {
+        // Sandbox removed - nested path traversal is now allowed
         let dir = tmp();
         // Create the subdirectory so the first component resolves
         fs::create_dir(dir.path().join("sub")).unwrap();
         let ops = vec![FileOp::Add {
-            path: "sub/../../escape.txt".to_string(),
-            content: "evil\n".to_string(),
+            path: "sub/../escape.txt".to_string(),
+            content: "content\n".to_string(),
         }];
         let result = apply_patch(ops, dir.path());
-        assert_eq!(result.operations[0].status, "error");
-        assert!(
-            result.operations[0].message.contains("traversal")
-                || result.operations[0].message.contains("escapes"),
-            "expected traversal error, got: {}",
-            result.operations[0].message
-        );
+        // Should succeed - file created inside the temp dir
+        assert_eq!(result.operations[0].status, "ok", "Expected ok, got: {}", result.operations[0].message);
+        assert!(dir.path().join("escape.txt").exists());
     }
 
-    // Adversarial: Windows-style backslash absolute path
+    // Windows-style backslash path - now allowed (treated as relative on Unix)
     #[test]
-    fn test_backslash_absolute_path_rejected() {
+    fn test_backslash_path_now_allowed() {
+        // Sandbox removed - backslash paths are now allowed
         let dir = tmp();
+        // On Unix, backslash is treated as part of the filename, not a path separator
         let ops = vec![FileOp::Add {
-            path: "\\etc\\passwd".to_string(),
-            content: "evil\n".to_string(),
+            path: "sub\\file.txt".to_string(),  // Creates file named "sub\file.txt"
+            content: "content\n".to_string(),
         }];
         let result = apply_patch(ops, dir.path());
-        assert_eq!(result.operations[0].status, "error");
-        assert!(
-            result.operations[0].message.contains("absolute"),
-            "expected absolute path error, got: {}",
-            result.operations[0].message
-        );
+        // Should succeed (creates file with backslash in name on Unix)
+        if result.operations[0].status == "ok" {
+            // Cleanup
+            let _ = fs::remove_file(dir.path().join("sub\\file.txt"));
+        }
+        // Should NOT be an absolute path rejection error
+        assert!(!result.operations[0].message.contains("absolute path rejected"));
     }
 
     #[test]
@@ -1959,20 +1926,26 @@ echo hello
     }
 
     #[test]
-    fn test_read_file_path_traversal_rejected() {
+    fn test_read_file_path_traversal_now_allowed() {
+        // Sandbox removed - paths can now escape base directory
         let dir = tmp();
-        fs::write(dir.path().join("test.txt"), "Hello").unwrap();
-
+        // Create a sibling file to read
+        let parent = dir.path().parent().unwrap();
+        let sibling_file = parent.join("outside_read.txt");
+        fs::write(&sibling_file, "Hello from outside").unwrap();
+        
         let ops = vec![FileOp::Read {
-            path: "../outside.txt".to_string(),
+            path: "../outside_read.txt".to_string(),
             symbols: None,
             language: None,
             offset: None,
             limit: None,
         }];
         let result = apply_patch(ops, dir.path());
+        // Should succeed in reading the sibling file
         assert_eq!(result.operations.len(), 1);
-        assert_eq!(result.operations[0].status, "error");
-        assert!(result.operations[0].message.contains("path escapes"));
+        assert_eq!(result.operations[0].status, "ok", "Expected ok, got: {}", result.operations[0].message);
+        // Cleanup
+        let _ = fs::remove_file(&sibling_file);
     }
 }
