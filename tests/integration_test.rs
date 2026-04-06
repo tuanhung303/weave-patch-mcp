@@ -288,7 +288,7 @@ fn patch_very_long_lines_handled() {
     let long_prefix = "x".repeat(5000);
     let long_suffix = "y".repeat(5000);
     let target = format!("{}TARGET{}", long_prefix, long_suffix);
-    let original = format!("{}", target);
+    let original = target.to_string();
     fs::write(dir.path().join("longlines.txt"), &original).unwrap();
 
     let replacement = format!("{}REPLACEMENT{}", long_prefix, long_suffix);
@@ -314,9 +314,9 @@ fn patch_very_long_lines_handled() {
     assert!(!content.contains("TARGET"), "Old content should be gone");
 }
 
-/// Test 8: Concurrent shadow file collision (tests atomic shadow file creation)
+/// Test 8: Sequential patch on same file (tests context mismatch behavior)
 #[test]
-fn concurrent_shadow_file_collision() {
+fn sequential_patch_same_file() {
     let dir = tmp();
     fs::write(dir.path().join("concurrent.txt"), "original\n").unwrap();
 
@@ -339,14 +339,14 @@ fn concurrent_shadow_file_collision() {
 
     // Apply both patches sequentially (simulating concurrent access pattern)
     let ops1 = parse_patch(patch1).unwrap();
-    let result1 = apply_patch(ops1, dir.path());
+    let _result1 = apply_patch(ops1, dir.path());
 
     // After first patch, the content should be different
-    let content1 = fs::read_to_string(dir.path().join("concurrent.txt")).unwrap();
+    let _content1 = fs::read_to_string(dir.path().join("concurrent.txt")).unwrap();
 
     // Second patch should fail because context "original" no longer exists
     let ops2 = parse_patch(patch2).unwrap();
-    let result2 = apply_patch(ops2, dir.path());
+    let _result2 = apply_patch(ops2, dir.path());
 
     // One should succeed, one might fail depending on timing
     // The key is that the file should never be corrupted
@@ -361,7 +361,7 @@ fn concurrent_shadow_file_collision() {
     // Atomicity check: file should never be in a partially written state
     let lines: Vec<&str> = final_content.lines().collect();
     assert!(
-        lines.len() >= 1 && lines.len() <= 3,
+        !lines.is_empty() && lines.len() <= 3,
         "File should have consistent line count, got: {:?}",
         lines
     );
@@ -585,4 +585,171 @@ fn test_mixed_operations_in_patch() {
 
     let keep_content = fs::read_to_string(dir.path().join("keep.txt")).unwrap();
     assert!(keep_content.contains("Keep this"), "keep.txt unchanged");
+}
+
+/// Test: Word-boundary hint matching with $ suffix
+/// @@ fn foo$ should match 'fn foo()' but not 'fn foo_bar()'
+#[test]
+fn test_word_boundary_hint_matching() {
+    let dir = tmp();
+    fs::write(
+        dir.path().join("functions.py"),
+        "def foo():\n    return 1\n\ndef foo_bar():\n    return 2\n\ndef bar():\n    return 3\n",
+    )
+    .unwrap();
+
+    // Test 1: @@ def foo$ should match 'def foo():' but not 'def foo_bar():'
+    let input = concat!(
+        "*** Begin Patch\n",
+        "*** Update File: functions.py\n",
+        "@@ def foo$\n",
+        " def foo():\n",
+        "-    return 1\n",
+        "+    return 10\n",
+        "*** End Patch",
+    );
+
+    let ops = parse_patch(input).unwrap();
+    let result = apply_patch(ops, dir.path());
+    assert_eq!(
+        result.operations[0].status, "ok",
+        "Word-boundary hint should match exactly 'def foo()': {}",
+        result.operations[0].message
+    );
+
+    let content = fs::read_to_string(dir.path().join("functions.py")).unwrap();
+
+    // Should have modified foo(), not foo_bar()
+    assert!(
+        content.contains("def foo():\n    return 10"),
+        "Should have updated foo() to return 10, got:\n{content}"
+    );
+    assert!(
+        content.contains("def foo_bar():\n    return 2"),
+        "Should NOT have modified foo_bar(), got:\n{content}"
+    );
+    assert!(
+        content.contains("def bar():\n    return 3"),
+        "bar() should be unchanged, got:\n{content}"
+    );
+
+    // Reset file for test 2
+    fs::write(
+        dir.path().join("functions.py"),
+        "def foo():\n    return 1\n\ndef foo_bar():\n    return 2\n\ndef bar():\n    return 3\n",
+    )
+    .unwrap();
+
+    // Test 2: Without $ suffix, should match first occurrence (could be foo_bar)
+    // Actually without $ it matches any line containing 'def foo', so it could match foo_bar
+    // Let's verify that $ makes it specific
+    let input2 = concat!(
+        "*** Begin Patch\n",
+        "*** Update File: functions.py\n",
+        "@@ def foo_bar$\n",
+        " def foo_bar():\n",
+        "-    return 2\n",
+        "+    return 20\n",
+        "*** End Patch",
+    );
+
+    let ops2 = parse_patch(input2).unwrap();
+    let result2 = apply_patch(ops2, dir.path());
+    assert_eq!(
+        result2.operations[0].status, "ok",
+        "Word-boundary hint should match 'def foo_bar()': {}",
+        result2.operations[0].message
+    );
+
+    let content2 = fs::read_to_string(dir.path().join("functions.py")).unwrap();
+    assert!(
+        content2.contains("def foo_bar():\n    return 20"),
+        "Should have updated foo_bar() to return 20, got:\n{content2}"
+    );
+    assert!(
+        content2.contains("def foo():\n    return 1"),
+        "foo() should be unchanged, got:\n{content2}"
+    );
+}
+
+/// Test: Parallel patch application for multiple files
+/// Create 10 files, patch all in parallel, verify atomic commit
+#[test]
+fn test_parallel_patch_multiple_files() {
+    let dir = tmp();
+
+    // Create 10 files
+    for i in 0..10 {
+        fs::write(
+            dir.path().join(format!("file{}.txt", i)),
+            format!("content {}\n", i),
+        )
+        .unwrap();
+    }
+
+    // Create a patch that updates all 10 files
+    let mut patch_lines = vec!["*** Begin Patch".to_string()];
+    for i in 0..10 {
+        patch_lines.push(format!("*** Update File: file{}.txt", i));
+        patch_lines.push(format!("  content {}", i));
+        patch_lines.push(format!("+new line {}", i));
+    }
+    patch_lines.push("*** End Patch".to_string());
+
+    let input = patch_lines.join("\n");
+    let ops = parse_patch(&input).unwrap();
+    assert_eq!(ops.len(), 10, "Should have 10 update operations");
+
+    let result = apply_patch(ops, dir.path());
+
+    // All operations should succeed
+    for (i, op) in result.operations.iter().enumerate() {
+        assert_eq!(
+            op.status, "ok",
+            "Operation {} should succeed: {}",
+            i, op.message
+        );
+    }
+
+    // Verify all files were updated
+    for i in 0..10 {
+        let content = fs::read_to_string(dir.path().join(format!("file{}.txt", i))).unwrap();
+        assert!(
+            content.contains(&format!("new line {}", i)),
+            "file{}.txt should have new line, got:\n{}",
+            i,
+            content
+        );
+    }
+}
+
+/// Test: Conflict detection - Add+Update on same path should error
+#[test]
+fn test_conflict_add_update_same_path() {
+    let dir = tmp();
+
+    // Try to Add and Update the same file in one patch
+    let input = concat!(
+        "*** Begin Patch\n",
+        "*** Add File: conflict.txt\n",
+        "+new content\n",
+        "*** Update File: conflict.txt\n",
+        "-old content\n",
+        "+updated content\n",
+        "*** End Patch",
+    );
+
+    let ops = parse_patch(input).unwrap();
+    let result = apply_patch(ops, dir.path());
+
+    // Should have an error due to conflict
+    let has_error = result.operations.iter().any(|op| op.status == "error");
+    assert!(has_error, "Should detect Add+Update conflict");
+
+    // At least one operation should mention conflict
+    let has_conflict_msg = result
+        .operations
+        .iter()
+        .any(|op| op.message.contains("Cannot Add and Update") || op.message.contains("conflict"));
+    assert!(has_conflict_msg, "Error message should mention conflict");
 }

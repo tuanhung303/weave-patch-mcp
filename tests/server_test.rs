@@ -46,16 +46,23 @@ fn read_single_file_not_found() {
 }
 
 #[test]
-fn read_single_file_path_traversal_rejected() {
+fn read_single_file_path_traversal_now_allowed() {
+    // Sandbox removed per user request - paths can now escape base directory
     let dir = tmp();
-
-    // Create a file outside the test dir (simulated)
     let outside = tmp();
     fs::write(outside.path().join("secret.txt"), "secret").unwrap();
 
-    // Path traversal should be rejected by validate_path
+    // Path traversal is now allowed - validate_path just joins the paths
     let result = validate_path(dir.path(), "../secret.txt");
-    assert!(result.is_err(), "Should reject path traversal");
+    assert!(
+        result.is_ok(),
+        "Path traversal should now be allowed: {:?}",
+        result
+    );
+
+    let resolved = result.unwrap();
+    // The path should resolve to the secret.txt file
+    assert!(resolved.ends_with("secret.txt") || resolved.to_string_lossy().contains("secret.txt"));
 }
 
 #[cfg(unix)]
@@ -409,7 +416,7 @@ fn batch_move_file_success() {
 *** End Patch"#;
 
     let ops = parse_patch(patch).unwrap();
-    let result = apply_patch(ops, dir.path());
+    let _result = apply_patch(ops, dir.path());
 
     // Move may be supported; check file state
     let old_exists = dir.path().join("old.txt").exists();

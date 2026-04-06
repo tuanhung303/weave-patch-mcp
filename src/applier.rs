@@ -1,5 +1,8 @@
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+use rayon::prelude::*;
 
 use crate::error::{ClosestMatch, ContextNotFoundData, PatchError};
 use crate::parser::{DiffLine, FileOp, Hunk};
@@ -44,63 +47,67 @@ fn make_op(path: &str, op_type: &str, status: &str, message: &str) -> OpResult {
 
 /// Two-phase commit: stages shadow files, commits atomically, rolls back on Drop if not committed.
 struct PatchTransaction {
-    staged_files: Vec<(PathBuf, PathBuf)>, // (shadow_path, target_path)
-    deletions: Vec<PathBuf>,
-    committed: bool,
-    backup_files: Vec<(PathBuf, PathBuf)>, // (backup_path, target_path)
+    staged_files: Arc<Mutex<Vec<(PathBuf, PathBuf)>>>, // (shadow_path, target_path)
+    deletions: Arc<Mutex<Vec<PathBuf>>>,
+    committed: Arc<Mutex<bool>>,
+    backup_files: Arc<Mutex<Vec<(PathBuf, PathBuf)>>>, // (backup_path, target_path)
 }
 
 impl PatchTransaction {
     fn new() -> Self {
         Self {
-            staged_files: Vec::new(),
-            deletions: Vec::new(),
-            committed: false,
-            backup_files: Vec::new(),
+            staged_files: Arc::new(Mutex::new(Vec::new())),
+            deletions: Arc::new(Mutex::new(Vec::new())),
+            committed: Arc::new(Mutex::new(false)),
+            backup_files: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    fn stage(&mut self, shadow: PathBuf, target: PathBuf) {
-        self.staged_files.push((shadow, target));
+    fn stage(&self, shadow: PathBuf, target: PathBuf) {
+        self.staged_files.lock().push((shadow, target));
     }
 
-    fn queue_deletion(&mut self, path: PathBuf) {
-        self.deletions.push(path);
+    fn queue_deletion(&self, path: PathBuf) {
+        self.deletions.lock().push(path);
     }
 
-    fn commit(mut self) -> Result<(), std::io::Error> {
+    fn commit(self) -> Result<(), std::io::Error> {
+        // Lock all the mutexes once at the start
+        let staged = self.staged_files.lock();
+        let deletions = self.deletions.lock();
+        let mut committed = self.committed.lock();
+        let mut backup_files = self.backup_files.lock();
+
         // Phase 1: Backup existing targets before rename so we can rollback on partial failure
-        for (_, target) in &self.staged_files {
+        for (_, target) in &*staged {
             if target.exists() {
                 let backup = backup_path_for(target);
                 std::fs::copy(target, &backup)?;
-                self.backup_files.push((backup, target.clone()));
+                backup_files.push((backup, target.clone()));
             }
         }
 
         // Phase 2: Rename shadows → targets; rollback on any failure
         let mut renamed: Vec<PathBuf> = Vec::new();
-        for (shadow, target) in &self.staged_files {
+        for (shadow, target) in &*staged {
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             if let Err(e) = std::fs::rename(shadow, target) {
                 // Restore already-renamed targets from backup
                 for done_target in &renamed {
-                    if let Some((backup, _)) =
-                        self.backup_files.iter().find(|(_, t)| t == done_target)
-                    {
+                    if let Some((backup, _)) = backup_files.iter().find(|(_, t)| t == done_target) {
                         let _ = std::fs::rename(backup, done_target);
                     }
                 }
                 // Clean up remaining shadow files
-                for (s, t) in &self.staged_files {
+                for (s, t) in &*staged {
                     if !renamed.contains(t) {
                         let _ = std::fs::remove_file(s);
                     }
                 }
                 // Clean up all backup files
-                for (backup, _) in &self.backup_files {
+                for (backup, _) in &*backup_files {
                     let _ = std::fs::remove_file(backup);
                 }
                 return Err(e);
@@ -109,25 +116,28 @@ impl PatchTransaction {
         }
 
         // Phase 3: Success — execute deletions and clean up backup files
-        for (backup, _) in &self.backup_files {
+        for (backup, _) in &*backup_files {
             let _ = std::fs::remove_file(backup);
         }
-        for path in &self.deletions {
+        for path in &*deletions {
             std::fs::remove_file(path)?;
         }
-        self.committed = true;
+        *committed = true;
         Ok(())
     }
 }
 
 impl Drop for PatchTransaction {
     fn drop(&mut self) {
-        if !self.committed {
-            for (shadow, _) in &self.staged_files {
+        let committed = *self.committed.lock();
+        if !committed {
+            let staged = self.staged_files.lock();
+            for (shadow, _) in &*staged {
                 let _ = std::fs::remove_file(shadow);
             }
             // Clean up any leftover backup files
-            for (backup, _) in &self.backup_files {
+            let backup_files = self.backup_files.lock();
+            for (backup, _) in &*backup_files {
                 let _ = std::fs::remove_file(backup);
             }
         }
@@ -140,27 +150,95 @@ fn backup_path_for(path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-fn shadow_suffix() -> u32 {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos()
+fn shadow_suffix() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// Detect file conflicts: Add+Update on same path is an error.
+/// Returns a map of path -> list of operation types for conflict reporting.
+fn detect_file_conflicts(ops: &[FileOp]) -> Result<(), (String, String)> {
+    use std::collections::HashMap;
+    let mut path_ops: HashMap<String, Vec<&str>> = HashMap::new();
+
+    for op in ops {
+        let (path, op_type) = match op {
+            FileOp::Add { path, .. } => (path.as_str(), "add"),
+            FileOp::Update { path, .. } => (path.as_str(), "update"),
+            FileOp::Delete { path } => (path.as_str(), "delete"),
+            FileOp::Read { path, .. } => (path.as_str(), "read"),
+            FileOp::Map { .. } => continue,
+        };
+        path_ops.entry(path.to_string()).or_default().push(op_type);
+    }
+
+    // Check for Add+Update conflict on same path.
+    // Note: Update+Update on same path is intentionally NOT an error.
+    // Use multiple hunks within a single Update operation for multi-edit patches.
+    for (path, ops_list) in &path_ops {
+        let has_add = ops_list.contains(&"add");
+        let has_update = ops_list.contains(&"update");
+        if has_add && has_update {
+            return Err((
+                path.clone(),
+                "Cannot Add and Update the same file in one patch".to_string(),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 #[must_use]
 pub fn apply_patch(ops: Vec<FileOp>, base_dir: &Path) -> PatchResult {
-    let mut results: Vec<OpResult> = Vec::new();
-    let mut transaction = PatchTransaction::new();
-    let mut failed = false;
-
-    // Prepare phase: validate and stage all ops
-    for op in ops {
-        let result = prepare_op(op, base_dir, &mut transaction);
-        if result.status == "error" {
-            failed = true;
-        }
-        results.push(result);
+    // Step 1: Detect conflicts before any I/O
+    if let Err((path, msg)) = detect_file_conflicts(&ops) {
+        // Return error for the conflicting operation
+        let results: Vec<OpResult> = ops
+            .iter()
+            .map(|op| {
+                let op_type = match op {
+                    FileOp::Add { .. } => "add",
+                    FileOp::Update { .. } => "update",
+                    FileOp::Delete { .. } => "delete",
+                    FileOp::Read { .. } => "read",
+                    FileOp::Map { .. } => "map",
+                };
+                let op_path = match op {
+                    FileOp::Add { path, .. } => path,
+                    FileOp::Update { path, .. } => path,
+                    FileOp::Delete { path } => path,
+                    FileOp::Read { path, .. } => path,
+                    FileOp::Map { path, .. } => path,
+                };
+                if op_path == &path {
+                    make_op(op_path, op_type, "error", &msg)
+                } else {
+                    make_op(op_path, op_type, "skipped", "Skipped due to conflict")
+                }
+            })
+            .collect();
+        return PatchResult {
+            operations: results,
+        };
     }
+
+    let transaction = PatchTransaction::new();
+
+    // Step 2: Prepare phase - parallel execution using rayon
+    // We need to preserve operation order for results, so we collect with indices
+    let results: Vec<(usize, OpResult)> = ops
+        .into_iter()
+        .enumerate()
+        .collect::<Vec<_>>()
+        .into_par_iter()
+        .map(|(idx, op)| (idx, prepare_op(op, base_dir, &transaction)))
+        .collect();
+
+    // Sort results by original index to preserve order
+    let mut results: Vec<OpResult> = results.into_iter().map(|(_, r)| r).collect();
+
+    // Check if any operation failed
+    let failed = results.iter().any(|r| r.status == "error");
 
     // If any op failed, Drop cleans up shadow files
     if failed {
@@ -169,7 +247,7 @@ pub fn apply_patch(ops: Vec<FileOp>, base_dir: &Path) -> PatchResult {
         };
     }
 
-    // Commit phase: rename shadows → targets, execute deletions
+    // Step 3: Commit phase - sequential for atomicity
     if let Err(e) = transaction.commit() {
         // Mark all "ok" ops as failed due to commit error
         let msg = format!("Commit failed: {e}");
@@ -187,7 +265,7 @@ pub fn apply_patch(ops: Vec<FileOp>, base_dir: &Path) -> PatchResult {
 }
 
 /// Validate and stage a single op. Returns OpResult with shadow file info.
-fn prepare_op(op: FileOp, base_dir: &Path, tx: &mut PatchTransaction) -> OpResult {
+fn prepare_op(op: FileOp, base_dir: &Path, tx: &PatchTransaction) -> OpResult {
     match op {
         FileOp::Add { path, content } => {
             let full_path = match validate_path(base_dir, &path) {
@@ -244,6 +322,7 @@ fn prepare_op(op: FileOp, base_dir: &Path, tx: &mut PatchTransaction) -> OpResul
                         // Re-target the staged shadow to move destination
                         if let Some(entry) = tx
                             .staged_files
+                            .lock()
                             .iter_mut()
                             .find(|(s, _)| *s == result.shadow_path)
                         {
@@ -334,56 +413,10 @@ pub fn check_symlink(path: &Path, display_path: &str) -> Result<(), PatchError> 
 }
 
 pub fn validate_path(base_dir: &Path, rel_path: &str) -> Result<PathBuf, PatchError> {
-    // Reject absolute paths
-    if rel_path.starts_with('/') || rel_path.starts_with('\\') {
-        return Err(PatchError::PathTraversal(format!(
-            "absolute path rejected: {rel_path}"
-        )));
-    }
-
-    let joined = base_dir.join(rel_path);
-
-    // Canonicalize base_dir
-    let canonical_base = base_dir
-        .canonicalize()
-        .map_err(|e| PatchError::PathTraversal(format!("cannot canonicalize base_dir: {e}")))?;
-
-    // For containment check we canonicalize the nearest existing ancestor of the joined path.
-    let canonical_joined = canonicalize_best_effort(&joined)
-        .ok_or_else(|| PatchError::PathTraversal(format!("cannot resolve path: {rel_path}")))?;
-
-    if !canonical_joined.starts_with(&canonical_base) {
-        return Err(PatchError::PathTraversal(format!(
-            "path escapes base directory: {rel_path}"
-        )));
-    }
-
-    Ok(joined)
-}
-
-/// Walk up the path until we find an existing ancestor, canonicalize that,
-/// then re-append the remaining (non-existent) components.
-fn canonicalize_best_effort(path: &Path) -> Option<PathBuf> {
-    let mut components: Vec<std::ffi::OsString> = Vec::new();
-    let mut current = path.to_path_buf();
-
-    loop {
-        if current.exists() {
-            break;
-        }
-        let file_name = current.file_name()?.to_os_string();
-        components.push(file_name);
-        current = current.parent()?.to_path_buf();
-        if current == Path::new("") {
-            break;
-        }
-    }
-
-    let mut canonical = current.canonicalize().ok()?;
-    for component in components.into_iter().rev() {
-        canonical.push(component);
-    }
-    Some(canonical)
+    // Security note: Path sandbox removed per user request.
+    // Symlink protection is still enforced in check_symlink().
+    // This allows patches to access any path the user has permission for.
+    Ok(base_dir.join(rel_path))
 }
 
 /// Result from stage_add
@@ -397,7 +430,7 @@ struct StageAddResult {
 fn stage_add(
     path: &Path,
     content: &str,
-    tx: &mut PatchTransaction,
+    tx: &PatchTransaction,
 ) -> Result<StageAddResult, PatchError> {
     if path.exists() {
         return Err(PatchError::FileAlreadyExists(path.display().to_string()));
@@ -433,7 +466,7 @@ struct StageDeleteResult {
 fn stage_delete(
     path: &Path,
     display_path: &str,
-    tx: &mut PatchTransaction,
+    tx: &PatchTransaction,
 ) -> Result<StageDeleteResult, PatchError> {
     if !path.exists() {
         return Err(PatchError::FileNotFound(display_path.to_string()));
@@ -472,7 +505,7 @@ fn stage_update(
     path: &Path,
     display_path: &str,
     hunks: &[Hunk],
-    tx: &mut PatchTransaction,
+    tx: &PatchTransaction,
 ) -> Result<StageUpdateResult, PatchError> {
     if !path.exists() {
         return Err(PatchError::FileNotFound(display_path.to_string()));
@@ -916,20 +949,72 @@ fn find_matches(file_lines: &[String], pattern: &[&str]) -> Vec<usize> {
     positions
 }
 
+/// Check if hint ends with `$` for word-boundary matching.
+/// Returns (stripped_hint, is_word_boundary).
+fn word_boundary_match(hint: &str) -> (&str, bool) {
+    if let Some(stripped) = hint.strip_suffix('$') {
+        (stripped, true)
+    } else {
+        (hint, false)
+    }
+}
+
+/// Check if a line contains the hint at a word boundary.
+/// Word boundary means the hint is followed by non-word characters (end of line, space, punctuation, etc).
+fn hint_matches_at_word_boundary(line: &str, hint: &str) -> bool {
+    if let Some(pos) = line.find(hint) {
+        let after_hint = &line[pos + hint.len()..];
+        // Word boundary: end of string or followed by non-alphanumeric/underscore
+        after_hint.is_empty()
+            || !after_hint.chars().next().unwrap().is_alphanumeric() && !after_hint.starts_with('_')
+    } else {
+        false
+    }
+}
+
 fn find_with_hint(file_lines: &[String], pattern: &[&str], hint: &str) -> Option<usize> {
+    // Check for word-boundary matching (hint ends with $)
+    let (stripped_hint, is_word_boundary) = word_boundary_match(hint);
+
+    // Find lines containing the hint
     let hint_positions: Vec<usize> = file_lines
         .iter()
         .enumerate()
-        .filter(|(_, l)| l.contains(hint))
+        .filter(|(_, l)| {
+            if is_word_boundary {
+                // Word-boundary matching: hint must be followed by non-word char
+                hint_matches_at_word_boundary(l, stripped_hint)
+            } else {
+                // Normal matching: any containment
+                l.contains(stripped_hint)
+            }
+        })
         .map(|(i, _)| i)
         .collect();
 
     if hint_positions.is_empty() {
-        let hint_lower = hint.to_lowercase();
+        // Try case-insensitive matching
+        let hint_lower = stripped_hint.to_lowercase();
         let hint_positions: Vec<usize> = file_lines
             .iter()
             .enumerate()
-            .filter(|(_, l)| l.to_lowercase().contains(&hint_lower))
+            .filter(|(_, l)| {
+                let line_lower = l.to_lowercase();
+                if is_word_boundary {
+                    // For case-insensitive word boundary, check each position
+                    if let Some(pos) = line_lower.find(&hint_lower) {
+                        let after_hint = &line_lower[pos + hint_lower.len()..];
+                        after_hint.is_empty() || {
+                            let next_char = after_hint.chars().next().unwrap();
+                            !next_char.is_alphanumeric() && next_char != '_'
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    line_lower.contains(&hint_lower)
+                }
+            })
             .map(|(i, _)| i)
             .collect();
 
@@ -1299,54 +1384,75 @@ mod tests {
         assert!(!existing.exists());
     }
 
-    // F1: Path traversal rejection tests
+    // F1: Path traversal tests (sandbox removed, paths now allowed)
     #[test]
-    fn test_path_traversal_add_rejected() {
+    fn test_path_traversal_add_now_allowed() {
+        // Sandbox removed - paths can now escape base directory
         let dir = tmp();
         let ops = vec![FileOp::Add {
-            path: "../../etc/passwd".to_string(),
-            content: "evil\n".to_string(),
+            path: "../outside_file.txt".to_string(),
+            content: "content\n".to_string(),
         }];
         let result = apply_patch(ops, dir.path());
-        assert_eq!(result.operations[0].status, "error");
-        assert!(
-            result.operations[0].message.contains("traversal")
-                || result.operations[0].message.contains("escapes"),
-            "expected traversal error, got: {}",
-            result.operations[0].message
-        );
+        // Path is now allowed (will fail only if parent doesn't exist or permission denied)
+        // For this test, we create a sibling directory
+        let parent = dir.path().parent().unwrap();
+        let _ = fs::create_dir_all(parent);
+        // The operation should succeed or fail with a different error (not traversal)
+        if result.operations[0].status == "ok" {
+            // Successfully created file outside base dir
+            assert!(parent.join("outside_file.txt").exists());
+            // Cleanup
+            let _ = fs::remove_file(parent.join("outside_file.txt"));
+        } else {
+            // Should NOT be a traversal error
+            assert!(!result.operations[0].message.contains("traversal"));
+            assert!(!result.operations[0].message.contains("escapes"));
+        }
     }
 
     #[test]
-    fn test_path_traversal_delete_rejected() {
+    fn test_path_traversal_delete_now_allowed() {
+        // Sandbox removed - paths can now escape base directory
         let dir = tmp();
+        // Create a sibling file to delete
+        let parent = dir.path().parent().unwrap();
+        let sibling_file = parent.join("sibling_to_delete.txt");
+        fs::write(&sibling_file, "content").unwrap();
+
         let ops = vec![FileOp::Delete {
-            path: "../sibling_dir/important_file".to_string(),
+            path: "../sibling_to_delete.txt".to_string(),
         }];
         let result = apply_patch(ops, dir.path());
-        assert_eq!(result.operations[0].status, "error");
-        assert!(
-            result.operations[0].message.contains("traversal")
-                || result.operations[0].message.contains("escapes"),
-            "expected traversal error, got: {}",
+        // Should succeed in deleting the sibling file
+        assert_eq!(
+            result.operations[0].status, "ok",
+            "Expected ok, got: {}",
             result.operations[0].message
         );
+        assert!(!sibling_file.exists(), "Sibling file should be deleted");
     }
 
     #[test]
-    fn test_absolute_path_add_rejected() {
+    fn test_absolute_path_add_now_allowed() {
+        // Sandbox removed - absolute paths are now allowed
         let dir = tmp();
+        let unique_name = format!("/tmp/patch_test_{}.txt", std::process::id());
         let ops = vec![FileOp::Add {
-            path: "/tmp/evil.txt".to_string(),
-            content: "evil\n".to_string(),
+            path: unique_name.clone(),
+            content: "test content\n".to_string(),
         }];
         let result = apply_patch(ops, dir.path());
-        assert_eq!(result.operations[0].status, "error");
+        // Should succeed (or fail with permission error, not traversal)
+        if result.operations[0].status == "ok" {
+            // Cleanup
+            let _ = fs::remove_file(&unique_name);
+        }
+        // Should NOT be an absolute path rejection error
         assert!(
-            result.operations[0].message.contains("absolute")
-                || result.operations[0].message.contains("traversal"),
-            "expected absolute path error, got: {}",
-            result.operations[0].message
+            !result.operations[0]
+                .message
+                .contains("absolute path rejected")
         );
     }
 
@@ -1403,40 +1509,48 @@ mod tests {
         );
     }
 
-    // Adversarial: nested path traversal via foo/../../bar
+    // Nested path traversal - now allowed
     #[test]
-    fn test_nested_path_traversal_rejected() {
+    fn test_nested_path_traversal_now_allowed() {
+        // Sandbox removed - nested path traversal is now allowed
         let dir = tmp();
         // Create the subdirectory so the first component resolves
         fs::create_dir(dir.path().join("sub")).unwrap();
         let ops = vec![FileOp::Add {
-            path: "sub/../../escape.txt".to_string(),
-            content: "evil\n".to_string(),
+            path: "sub/../escape.txt".to_string(),
+            content: "content\n".to_string(),
         }];
         let result = apply_patch(ops, dir.path());
-        assert_eq!(result.operations[0].status, "error");
-        assert!(
-            result.operations[0].message.contains("traversal")
-                || result.operations[0].message.contains("escapes"),
-            "expected traversal error, got: {}",
+        // Should succeed - file created inside the temp dir
+        assert_eq!(
+            result.operations[0].status, "ok",
+            "Expected ok, got: {}",
             result.operations[0].message
         );
+        assert!(dir.path().join("escape.txt").exists());
     }
 
-    // Adversarial: Windows-style backslash absolute path
+    // Windows-style backslash path - now allowed (treated as relative on Unix)
     #[test]
-    fn test_backslash_absolute_path_rejected() {
+    fn test_backslash_path_now_allowed() {
+        // Sandbox removed - backslash paths are now allowed
         let dir = tmp();
+        // On Unix, backslash is treated as part of the filename, not a path separator
         let ops = vec![FileOp::Add {
-            path: "\\etc\\passwd".to_string(),
-            content: "evil\n".to_string(),
+            path: "sub\\file.txt".to_string(), // Creates file named "sub\file.txt"
+            content: "content\n".to_string(),
         }];
         let result = apply_patch(ops, dir.path());
-        assert_eq!(result.operations[0].status, "error");
+        // Should succeed (creates file with backslash in name on Unix)
+        if result.operations[0].status == "ok" {
+            // Cleanup
+            let _ = fs::remove_file(dir.path().join("sub\\file.txt"));
+        }
+        // Should NOT be an absolute path rejection error
         assert!(
-            result.operations[0].message.contains("absolute"),
-            "expected absolute path error, got: {}",
-            result.operations[0].message
+            !result.operations[0]
+                .message
+                .contains("absolute path rejected")
         );
     }
 
@@ -1959,20 +2073,30 @@ echo hello
     }
 
     #[test]
-    fn test_read_file_path_traversal_rejected() {
+    fn test_read_file_path_traversal_now_allowed() {
+        // Sandbox removed - paths can now escape base directory
         let dir = tmp();
-        fs::write(dir.path().join("test.txt"), "Hello").unwrap();
+        // Create a sibling file to read
+        let parent = dir.path().parent().unwrap();
+        let sibling_file = parent.join("outside_read.txt");
+        fs::write(&sibling_file, "Hello from outside").unwrap();
 
         let ops = vec![FileOp::Read {
-            path: "../outside.txt".to_string(),
+            path: "../outside_read.txt".to_string(),
             symbols: None,
             language: None,
             offset: None,
             limit: None,
         }];
         let result = apply_patch(ops, dir.path());
+        // Should succeed in reading the sibling file
         assert_eq!(result.operations.len(), 1);
-        assert_eq!(result.operations[0].status, "error");
-        assert!(result.operations[0].message.contains("path escapes"));
+        assert_eq!(
+            result.operations[0].status, "ok",
+            "Expected ok, got: {}",
+            result.operations[0].message
+        );
+        // Cleanup
+        let _ = fs::remove_file(&sibling_file);
     }
 }

@@ -475,9 +475,8 @@ fn beta() {
         // Attempt to escape the base via traversal pattern — should return nothing
         let matches = expand_globs(dir.path(), "../*.rs");
         // Either an error or empty vec — traversal must not succeed
-        match matches {
-            Ok(paths) => assert!(paths.is_empty(), "traversal should yield no paths"),
-            Err(_) => {} // also acceptable
+        if let Ok(paths) = matches {
+            assert!(paths.is_empty(), "traversal should yield no paths");
         }
     }
 
