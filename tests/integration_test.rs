@@ -314,9 +314,9 @@ fn patch_very_long_lines_handled() {
     assert!(!content.contains("TARGET"), "Old content should be gone");
 }
 
-/// Test 8: Concurrent shadow file collision (tests atomic shadow file creation)
+/// Test 8: Sequential patch on same file (tests context mismatch behavior)
 #[test]
-fn concurrent_shadow_file_collision() {
+fn sequential_patch_same_file() {
     let dir = tmp();
     fs::write(dir.path().join("concurrent.txt"), "original\n").unwrap();
 

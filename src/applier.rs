@@ -171,7 +171,9 @@ fn detect_file_conflicts(ops: &[FileOp]) -> Result<(), (String, String)> {
         path_ops.entry(path.to_string()).or_default().push(op_type);
     }
 
-    // Check for Add+Update conflict on same path
+    // Check for Add+Update conflict on same path.
+    // Note: Update+Update on same path is intentionally NOT an error.
+    // Use multiple hunks within a single Update operation for multi-edit patches.
     for (path, ops_list) in &path_ops {
         let has_add = ops_list.contains(&"add");
         let has_update = ops_list.contains(&"update");
@@ -184,27 +186,6 @@ fn detect_file_conflicts(ops: &[FileOp]) -> Result<(), (String, String)> {
     }
 
     Ok(())
-}
-
-/// Group operations by target file path for parallel processing.
-/// Returns a vector of (path, vector of operation indices).
-#[allow(dead_code)]
-fn group_ops_by_file(ops: &[FileOp]) -> Vec<(String, Vec<usize>)> {
-    use std::collections::HashMap;
-    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
-
-    for (idx, op) in ops.iter().enumerate() {
-        let path = match op {
-            FileOp::Add { path, .. } => path.clone(),
-            FileOp::Update { path, .. } => path.clone(),
-            FileOp::Delete { path } => path.clone(),
-            FileOp::Read { path, .. } => path.clone(),
-            FileOp::Map { .. } => continue,
-        };
-        groups.entry(path).or_default().push(idx);
-    }
-
-    groups.into_iter().collect()
 }
 
 #[must_use]
