@@ -394,7 +394,7 @@ fn terraform_valid_file_returns_empty() {
     let path = dir.path().join("valid.tf");
     fs::write(&path, content).unwrap();
 
-    let result = validate_file(&path, &path);
+    let _result = validate_file(&path, &path);
     // Terraform fmt returns exit code 0 for valid files
     // Note: terraform fmt -check returns non-zero if formatting is needed
     // but no syntax errors

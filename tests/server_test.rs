@@ -54,8 +54,12 @@ fn read_single_file_path_traversal_now_allowed() {
 
     // Path traversal is now allowed - validate_path just joins the paths
     let result = validate_path(dir.path(), "../secret.txt");
-    assert!(result.is_ok(), "Path traversal should now be allowed: {:?}", result);
-    
+    assert!(
+        result.is_ok(),
+        "Path traversal should now be allowed: {:?}",
+        result
+    );
+
     let resolved = result.unwrap();
     // The path should resolve to the secret.txt file
     assert!(resolved.ends_with("secret.txt") || resolved.to_string_lossy().contains("secret.txt"));
@@ -412,7 +416,7 @@ fn batch_move_file_success() {
 *** End Patch"#;
 
     let ops = parse_patch(patch).unwrap();
-    let result = apply_patch(ops, dir.path());
+    let _result = apply_patch(ops, dir.path());
 
     // Move may be supported; check file state
     let old_exists = dir.path().join("old.txt").exists();

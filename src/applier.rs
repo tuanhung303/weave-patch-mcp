@@ -96,9 +96,7 @@ impl PatchTransaction {
             if let Err(e) = std::fs::rename(shadow, target) {
                 // Restore already-renamed targets from backup
                 for done_target in &renamed {
-                    if let Some((backup, _)) =
-                        backup_files.iter().find(|(_, t)| t == done_target)
-                    {
+                    if let Some((backup, _)) = backup_files.iter().find(|(_, t)| t == done_target) {
                         let _ = std::fs::rename(backup, done_target);
                     }
                 }
@@ -161,7 +159,7 @@ fn shadow_suffix() -> String {
 fn detect_file_conflicts(ops: &[FileOp]) -> Result<(), (String, String)> {
     use std::collections::HashMap;
     let mut path_ops: HashMap<String, Vec<&str>> = HashMap::new();
-    
+
     for op in ops {
         let (path, op_type) = match op {
             FileOp::Add { path, .. } => (path.as_str(), "add"),
@@ -172,16 +170,19 @@ fn detect_file_conflicts(ops: &[FileOp]) -> Result<(), (String, String)> {
         };
         path_ops.entry(path.to_string()).or_default().push(op_type);
     }
-    
+
     // Check for Add+Update conflict on same path
     for (path, ops_list) in &path_ops {
-        let has_add = ops_list.iter().any(|&t| t == "add");
-        let has_update = ops_list.iter().any(|&t| t == "update");
+        let has_add = ops_list.contains(&"add");
+        let has_update = ops_list.contains(&"update");
         if has_add && has_update {
-            return Err((path.clone(), "Cannot Add and Update the same file in one patch".to_string()));
+            return Err((
+                path.clone(),
+                "Cannot Add and Update the same file in one patch".to_string(),
+            ));
         }
     }
-    
+
     Ok(())
 }
 
@@ -191,7 +192,7 @@ fn detect_file_conflicts(ops: &[FileOp]) -> Result<(), (String, String)> {
 fn group_ops_by_file(ops: &[FileOp]) -> Vec<(String, Vec<usize>)> {
     use std::collections::HashMap;
     let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
-    
+
     for (idx, op) in ops.iter().enumerate() {
         let path = match op {
             FileOp::Add { path, .. } => path.clone(),
@@ -202,7 +203,7 @@ fn group_ops_by_file(ops: &[FileOp]) -> Vec<(String, Vec<usize>)> {
         };
         groups.entry(path).or_default().push(idx);
     }
-    
+
     groups.into_iter().collect()
 }
 
@@ -211,28 +212,33 @@ pub fn apply_patch(ops: Vec<FileOp>, base_dir: &Path) -> PatchResult {
     // Step 1: Detect conflicts before any I/O
     if let Err((path, msg)) = detect_file_conflicts(&ops) {
         // Return error for the conflicting operation
-        let results: Vec<OpResult> = ops.iter().map(|op| {
-            let op_type = match op {
-                FileOp::Add { .. } => "add",
-                FileOp::Update { .. } => "update",
-                FileOp::Delete { .. } => "delete",
-                FileOp::Read { .. } => "read",
-                FileOp::Map { .. } => "map",
-            };
-            let op_path = match op {
-                FileOp::Add { path, .. } => path,
-                FileOp::Update { path, .. } => path,
-                FileOp::Delete { path } => path,
-                FileOp::Read { path, .. } => path,
-                FileOp::Map { path, .. } => path,
-            };
-            if op_path == &path {
-                make_op(op_path, op_type, "error", &msg)
-            } else {
-                make_op(op_path, op_type, "skipped", "Skipped due to conflict")
-            }
-        }).collect();
-        return PatchResult { operations: results };
+        let results: Vec<OpResult> = ops
+            .iter()
+            .map(|op| {
+                let op_type = match op {
+                    FileOp::Add { .. } => "add",
+                    FileOp::Update { .. } => "update",
+                    FileOp::Delete { .. } => "delete",
+                    FileOp::Read { .. } => "read",
+                    FileOp::Map { .. } => "map",
+                };
+                let op_path = match op {
+                    FileOp::Add { path, .. } => path,
+                    FileOp::Update { path, .. } => path,
+                    FileOp::Delete { path } => path,
+                    FileOp::Read { path, .. } => path,
+                    FileOp::Map { path, .. } => path,
+                };
+                if op_path == &path {
+                    make_op(op_path, op_type, "error", &msg)
+                } else {
+                    make_op(op_path, op_type, "skipped", "Skipped due to conflict")
+                }
+            })
+            .collect();
+        return PatchResult {
+            operations: results,
+        };
     }
 
     let transaction = PatchTransaction::new();
@@ -244,15 +250,11 @@ pub fn apply_patch(ops: Vec<FileOp>, base_dir: &Path) -> PatchResult {
         .enumerate()
         .collect::<Vec<_>>()
         .into_par_iter()
-        .map(|(idx, op)| {
-            (idx, prepare_op(op, base_dir, &transaction))
-        })
+        .map(|(idx, op)| (idx, prepare_op(op, base_dir, &transaction)))
         .collect();
 
     // Sort results by original index to preserve order
-    let mut results: Vec<OpResult> = results.into_iter()
-        .map(|(_, r)| r)
-        .collect();
+    let mut results: Vec<OpResult> = results.into_iter().map(|(_, r)| r).collect();
 
     // Check if any operation failed
     let failed = results.iter().any(|r| r.status == "error");
@@ -969,8 +971,8 @@ fn find_matches(file_lines: &[String], pattern: &[&str]) -> Vec<usize> {
 /// Check if hint ends with `$` for word-boundary matching.
 /// Returns (stripped_hint, is_word_boundary).
 fn word_boundary_match(hint: &str) -> (&str, bool) {
-    if hint.ends_with('$') {
-        (&hint[..hint.len()-1], true)
+    if let Some(stripped) = hint.strip_suffix('$') {
+        (stripped, true)
     } else {
         (hint, false)
     }
@@ -982,7 +984,8 @@ fn hint_matches_at_word_boundary(line: &str, hint: &str) -> bool {
     if let Some(pos) = line.find(hint) {
         let after_hint = &line[pos + hint.len()..];
         // Word boundary: end of string or followed by non-alphanumeric/underscore
-        after_hint.is_empty() || !after_hint.chars().next().unwrap().is_alphanumeric() && after_hint.chars().next().unwrap() != '_'
+        after_hint.is_empty()
+            || !after_hint.chars().next().unwrap().is_alphanumeric() && !after_hint.starts_with('_')
     } else {
         false
     }
@@ -991,7 +994,7 @@ fn hint_matches_at_word_boundary(line: &str, hint: &str) -> bool {
 fn find_with_hint(file_lines: &[String], pattern: &[&str], hint: &str) -> Option<usize> {
     // Check for word-boundary matching (hint ends with $)
     let (stripped_hint, is_word_boundary) = word_boundary_match(hint);
-    
+
     // Find lines containing the hint
     let hint_positions: Vec<usize> = file_lines
         .iter()
@@ -1435,13 +1438,17 @@ mod tests {
         let parent = dir.path().parent().unwrap();
         let sibling_file = parent.join("sibling_to_delete.txt");
         fs::write(&sibling_file, "content").unwrap();
-        
+
         let ops = vec![FileOp::Delete {
             path: "../sibling_to_delete.txt".to_string(),
         }];
         let result = apply_patch(ops, dir.path());
         // Should succeed in deleting the sibling file
-        assert_eq!(result.operations[0].status, "ok", "Expected ok, got: {}", result.operations[0].message);
+        assert_eq!(
+            result.operations[0].status, "ok",
+            "Expected ok, got: {}",
+            result.operations[0].message
+        );
         assert!(!sibling_file.exists(), "Sibling file should be deleted");
     }
 
@@ -1461,7 +1468,11 @@ mod tests {
             let _ = fs::remove_file(&unique_name);
         }
         // Should NOT be an absolute path rejection error
-        assert!(!result.operations[0].message.contains("absolute path rejected"));
+        assert!(
+            !result.operations[0]
+                .message
+                .contains("absolute path rejected")
+        );
     }
 
     // F2: Symlink rejection test
@@ -1530,7 +1541,11 @@ mod tests {
         }];
         let result = apply_patch(ops, dir.path());
         // Should succeed - file created inside the temp dir
-        assert_eq!(result.operations[0].status, "ok", "Expected ok, got: {}", result.operations[0].message);
+        assert_eq!(
+            result.operations[0].status, "ok",
+            "Expected ok, got: {}",
+            result.operations[0].message
+        );
         assert!(dir.path().join("escape.txt").exists());
     }
 
@@ -1541,7 +1556,7 @@ mod tests {
         let dir = tmp();
         // On Unix, backslash is treated as part of the filename, not a path separator
         let ops = vec![FileOp::Add {
-            path: "sub\\file.txt".to_string(),  // Creates file named "sub\file.txt"
+            path: "sub\\file.txt".to_string(), // Creates file named "sub\file.txt"
             content: "content\n".to_string(),
         }];
         let result = apply_patch(ops, dir.path());
@@ -1551,7 +1566,11 @@ mod tests {
             let _ = fs::remove_file(dir.path().join("sub\\file.txt"));
         }
         // Should NOT be an absolute path rejection error
-        assert!(!result.operations[0].message.contains("absolute path rejected"));
+        assert!(
+            !result.operations[0]
+                .message
+                .contains("absolute path rejected")
+        );
     }
 
     #[test]
@@ -2080,7 +2099,7 @@ echo hello
         let parent = dir.path().parent().unwrap();
         let sibling_file = parent.join("outside_read.txt");
         fs::write(&sibling_file, "Hello from outside").unwrap();
-        
+
         let ops = vec![FileOp::Read {
             path: "../outside_read.txt".to_string(),
             symbols: None,
@@ -2091,7 +2110,11 @@ echo hello
         let result = apply_patch(ops, dir.path());
         // Should succeed in reading the sibling file
         assert_eq!(result.operations.len(), 1);
-        assert_eq!(result.operations[0].status, "ok", "Expected ok, got: {}", result.operations[0].message);
+        assert_eq!(
+            result.operations[0].status, "ok",
+            "Expected ok, got: {}",
+            result.operations[0].message
+        );
         // Cleanup
         let _ = fs::remove_file(&sibling_file);
     }
