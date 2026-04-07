@@ -8,6 +8,10 @@ use crate::error::{ClosestMatch, ContextNotFoundData, PatchError};
 use crate::parser::{DiffLine, FileOp, Hunk};
 use similar::TextDiff;
 
+/// Default fuzzy matching threshold (97% similarity required).
+/// Higher threshold reduces false positives in context matching.
+pub const FUZZY_THRESHOLD: f32 = 0.97;
+
 #[derive(Debug, serde::Serialize)]
 pub struct OpResult {
     pub path: String,
@@ -194,6 +198,21 @@ fn detect_file_conflicts(ops: &[FileOp]) -> Result<(), (String, String)> {
 
 #[must_use]
 pub fn apply_patch(ops: Vec<FileOp>, base_dir: &Path) -> PatchResult {
+    apply_patch_with_threshold(ops, base_dir, None)
+}
+
+/// Apply patch operations with an optional fuzzy matching threshold.
+///
+/// # Arguments
+/// * `ops` - Vector of file operations to apply
+/// * `base_dir` - Base directory for resolving relative paths
+/// * `threshold` - Optional fuzzy matching threshold (0.0-1.0). Defaults to FUZZY_THRESHOLD (0.97) if None.
+#[must_use]
+pub fn apply_patch_with_threshold(
+    ops: Vec<FileOp>,
+    base_dir: &Path,
+    threshold: Option<f32>,
+) -> PatchResult {
     // Step 1: Detect conflicts before any I/O
     if let Err((path, msg)) = detect_file_conflicts(&ops) {
         // Return error for the conflicting operation
@@ -235,7 +254,7 @@ pub fn apply_patch(ops: Vec<FileOp>, base_dir: &Path) -> PatchResult {
         .enumerate()
         .collect::<Vec<_>>()
         .into_par_iter()
-        .map(|(idx, op)| (idx, prepare_op(op, base_dir, &transaction)))
+        .map(|(idx, op)| (idx, prepare_op(op, base_dir, &transaction, threshold)))
         .collect();
 
     // Sort results by original index to preserve order
@@ -269,7 +288,12 @@ pub fn apply_patch(ops: Vec<FileOp>, base_dir: &Path) -> PatchResult {
 }
 
 /// Validate and stage a single op. Returns OpResult with shadow file info.
-fn prepare_op(op: FileOp, base_dir: &Path, tx: &PatchTransaction) -> OpResult {
+fn prepare_op(
+    op: FileOp,
+    base_dir: &Path,
+    tx: &PatchTransaction,
+    threshold: Option<f32>,
+) -> OpResult {
     match op {
         FileOp::Add { path, content } => {
             let full_path = match validate_path(base_dir, &path) {
@@ -309,7 +333,7 @@ fn prepare_op(op: FileOp, base_dir: &Path, tx: &PatchTransaction) -> OpResult {
                 Err(e) => return make_op(&path, "update", "error", &e.to_string()),
             };
 
-            match stage_update(&full_path, &path, &hunks, tx) {
+            match stage_update(&full_path, &path, &hunks, tx, threshold) {
                 Ok(result) => {
                     if let Some(ref dest) = move_to {
                         let dest_path = match validate_path(base_dir, dest) {
@@ -510,6 +534,7 @@ fn stage_update(
     display_path: &str,
     hunks: &[Hunk],
     tx: &PatchTransaction,
+    threshold: Option<f32>,
 ) -> Result<StageUpdateResult, PatchError> {
     if !path.exists() {
         return Err(PatchError::FileNotFound(display_path.to_string()));
@@ -529,7 +554,7 @@ fn stage_update(
     let mut hunk_results: Vec<HunkResult> = Vec::new();
 
     for hunk in hunks {
-        let (new_lines, hunk_result) = apply_hunk(file_lines, hunk, display_path)?;
+        let (new_lines, hunk_result) = apply_hunk(file_lines, hunk, display_path, threshold)?;
         hunk_results.push(hunk_result);
         file_lines = new_lines;
     }
@@ -651,6 +676,7 @@ fn apply_hunk(
     file_lines: Vec<String>,
     hunk: &Hunk,
     display_path: &str,
+    threshold: Option<f32>,
 ) -> Result<(Vec<String>, HunkResult), PatchError> {
     // Build the search pattern: Context + Remove lines (in order)
     let search_pattern: Vec<&str> = hunk
@@ -686,7 +712,7 @@ fn apply_hunk(
     }
 
     // Find all matching positions — track match type
-    let (match_pos, match_type) = find_matches_with_type(&file_lines, &search_pattern);
+    let (match_pos, match_type) = find_matches_with_type(&file_lines, &search_pattern, threshold);
 
     let match_pos = match match_pos.len() {
         0 => {
@@ -889,7 +915,11 @@ fn nearest_excerpt_with_matches(
 /// match_type_label is "exact", "normalized", or "fuzzy:N%".
 /// Backwards-compatible wrapper that discards match type info.
 #[allow(dead_code)]
-fn find_matches_with_type(file_lines: &[String], pattern: &[&str]) -> (Vec<usize>, String) {
+fn find_matches_with_type(
+    file_lines: &[String],
+    pattern: &[&str],
+    threshold: Option<f32>,
+) -> (Vec<usize>, String) {
     if pattern.is_empty() {
         return (vec![], "none".to_string());
     }
@@ -920,6 +950,9 @@ fn find_matches_with_type(file_lines: &[String], pattern: &[&str]) -> (Vec<usize
     if pattern.len() < 3 || file_lines.len() > 2000 {
         return (vec![], "none".to_string());
     }
+    let effective_threshold = threshold
+        .map(|t| t.clamp(0.0, 1.0))
+        .unwrap_or(FUZZY_THRESHOLD);
     let pattern_text: String = pattern.join("\n") + "\n";
     let mut fuzzy_matches = Vec::new();
     for start in 0..=file_lines.len().saturating_sub(pattern.len()) {
@@ -931,7 +964,7 @@ fn find_matches_with_type(file_lines: &[String], pattern: &[&str]) -> (Vec<usize
             + "\n";
         let diff = TextDiff::from_chars(pattern_text.as_str(), window_text.as_str());
         let ratio = diff.ratio();
-        if ratio >= 0.85 {
+        if ratio >= effective_threshold {
             fuzzy_matches.push((start, ratio));
         }
     }
@@ -949,7 +982,7 @@ fn find_matches_with_type(file_lines: &[String], pattern: &[&str]) -> (Vec<usize
 /// Backwards-compatible wrapper that discards match type info.
 #[allow(dead_code)]
 fn find_matches(file_lines: &[String], pattern: &[&str]) -> Vec<usize> {
-    let (positions, _) = find_matches_with_type(file_lines, pattern);
+    let (positions, _) = find_matches_with_type(file_lines, pattern, None);
     positions
 }
 
@@ -1579,10 +1612,12 @@ mod tests {
             }],
             move_to: None,
         }];
-        let result = apply_patch(ops, dir.path());
+        // Use 0.85 threshold to match original fuzzy behavior
+        // With 0.97 default, this would fail due to low similarity
+        let result = apply_patch_with_threshold(ops, dir.path(), Some(0.85));
         assert_eq!(
             result.operations[0].status, "ok",
-            "Phase 2 normalized match should succeed: {}",
+            "Phase 2/3 match should succeed with 0.85 threshold: {}",
             result.operations[0].message
         );
         let content = fs::read_to_string(dir.path().join("code.rs")).unwrap();
@@ -1627,10 +1662,12 @@ mod tests {
             }],
             move_to: None,
         }];
-        let result = apply_patch(ops, dir.path());
+        // Use 0.85 threshold for fuzzy match with slight differences
+        // With 0.97 default, this would fail (similarity ~95%)
+        let result = apply_patch_with_threshold(ops, dir.path(), Some(0.85));
         assert_eq!(
             result.operations[0].status, "ok",
-            "Phase 3 fuzzy match should succeed: {}",
+            "Phase 3 fuzzy match should succeed with 0.85 threshold: {}",
             result.operations[0].message
         );
         let content = fs::read_to_string(dir.path().join("code.rs")).unwrap();

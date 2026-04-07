@@ -1,4 +1,4 @@
-use apply_patch_mcp::applier::apply_patch;
+use apply_patch_mcp::applier::{apply_patch, apply_patch_with_threshold};
 use apply_patch_mcp::parser::parse_patch;
 use std::fs;
 use tempfile::TempDir;
@@ -752,4 +752,332 @@ fn test_conflict_add_update_same_path() {
         .iter()
         .any(|op| op.message.contains("Cannot Add and Update") || op.message.contains("conflict"));
     assert!(has_conflict_msg, "Error message should mention conflict");
+}
+
+// ============================================================================
+// FUZZY THRESHOLD TESTS
+// ============================================================================
+
+/// Test: Default threshold (0.97) rejects low-similarity matches
+#[test]
+fn test_threshold_default_rejects_low_similarity() {
+    let dir = tmp();
+
+    // Create a file with content
+    let file_path = dir.path().join("test.txt");
+    std::fs::write(&file_path, "line one\nline two\nline three\nline four\n").unwrap();
+
+    // Try to update with context that's similar but not 97% match
+    let input = concat!(
+        "*** Begin Patch\n",
+        "*** Update File: test.txt\n",
+        "@@ line one\n",
+        " line ONE\n", // Changed case - ~75% similarity
+        "-line two\n",
+        "+line TWO\n",
+        "*** End Patch",
+    );
+
+    let ops = parse_patch(input).unwrap();
+    let result = apply_patch(ops, dir.path());
+
+    // Should fail because similarity is below 97%
+    assert!(
+        result.operations[0].status == "error",
+        "Should reject low-similarity match with 0.97 threshold"
+    );
+}
+
+/// Test: Lower threshold (0.80) accepts high-similarity fuzzy matches
+/// Note: Fuzzy matching only triggers for patterns >= 3 lines
+/// This test uses lines with minor char differences that fail normalized match
+#[test]
+fn test_threshold_low_accepts_medium_similarity() {
+    let dir = tmp();
+
+    // Create a file with content
+    let file_path = dir.path().join("test.txt");
+    std::fs::write(
+        &file_path,
+        "alpha beta\ngamma delta\nepsilon zeta\neta theta\n",
+    )
+    .unwrap();
+
+    // Pattern needs >= 3 lines to trigger fuzzy matching
+    // Lines differ by 1-2 characters each - fails normalized match, passes fuzzy
+    let input = concat!(
+        "*** Begin Patch\n",
+        "*** Update File: test.txt\n",
+        "@@ alpha\n",
+        " alpha betA\n",   // 1 char diff (A vs a) - 93% similarity
+        "-gamma deltA\n",  // 1 char diff (A vs a) - 93% similarity
+        " epsilon zeTa\n", // 1 char diff (T vs t) - 93% similarity
+        "+new content\n",
+        "*** End Patch",
+    );
+
+    let ops = parse_patch(input).unwrap();
+    let result = apply_patch_with_threshold(ops, dir.path(), Some(0.80));
+
+    // With threshold 0.80, fuzzy matching should accept ~93% similarity
+    assert!(
+        result.operations[0].status == "ok",
+        "Expected patch to succeed with threshold 0.80"
+    );
+}
+
+/// Test: Threshold 1.0 requires 100% similarity for fuzzy match
+/// Note: Fuzzy matching only triggers for patterns >= 3 lines
+/// This test uses lines with any character difference - fails 100% threshold
+#[test]
+fn test_threshold_1_0_requires_exact() {
+    let dir = tmp();
+
+    // Create a file with 3+ lines for fuzzy matching
+    let file_path = dir.path().join("test.txt");
+    std::fs::write(&file_path, "alpha beta\ngamma delta\nepsilon zeta\n").unwrap();
+
+    // Pattern with >= 3 lines to trigger fuzzy matching
+    // One char difference ensures < 100% similarity
+    let input = concat!(
+        "*** Begin Patch\n",
+        "*** Update File: test.txt\n",
+        "@@ alpha\n",
+        " alpha betA\n",   // 1 char diff (A vs a) - 93% similarity
+        "-gamma delta\n",  // Exact match
+        " epsilon zeta\n", // Exact match (3rd line ensures fuzzy)
+        "+new content\n",
+        "*** End Patch",
+    );
+
+    let ops = parse_patch(input).unwrap();
+    let result = apply_patch_with_threshold(ops, dir.path(), Some(1.0));
+
+    // With threshold 1.0, fuzzy match requires 100% similarity
+    // One char difference makes similarity < 100%, so fuzzy match fails
+    assert!(
+        result.operations[0].status == "error",
+        "Threshold 1.0 should require 100% similarity for fuzzy match"
+    );
+}
+
+/// Test: Default threshold matches FUZZY_THRESHOLD constant
+#[test]
+fn test_threshold_default_matches_constant() {
+    use apply_patch_mcp::applier::FUZZY_THRESHOLD;
+
+    // Verify the constant is 0.97
+    assert!(
+        (FUZZY_THRESHOLD - 0.97).abs() < 0.01,
+        "FUZZY_THRESHOLD should be 0.97, got {}",
+        FUZZY_THRESHOLD
+    );
+}
+
+// ============================================================================
+// LLM ERROR OUTPUT TESTS
+// ============================================================================
+
+/// Test: ContextNotFound produces LLM-readable output
+#[test]
+fn test_llm_error_context_not_found() {
+    let dir = tmp();
+
+    // Create a file
+    let file_path = dir.path().join("test.txt");
+    std::fs::write(&file_path, "actual content here\nmore lines\n").unwrap();
+
+    // Try to update with non-existent context
+    let input = concat!(
+        "*** Begin Patch\n",
+        "*** Update File: test.txt\n",
+        "@@ non existent context\n",
+        " non existent context\n",
+        "-old line\n",
+        "+new line\n",
+        "*** End Patch",
+    );
+
+    let ops = parse_patch(input).unwrap();
+    let result = apply_patch(ops, dir.path());
+
+    // Should error
+    assert!(result.operations[0].status == "error");
+
+    // Error message should be structured
+    let msg = &result.operations[0].message;
+    assert!(msg.contains("Context not found") || msg.contains("context"));
+}
+
+/// Test: FileNotFound produces LLM-readable output
+#[test]
+fn test_llm_error_file_not_found() {
+    use apply_patch_mcp::error::PatchError;
+
+    let err = PatchError::FileNotFound("missing.txt".to_string());
+    let output = err.to_json();
+
+    assert_eq!(output.file, "missing.txt");
+    assert_eq!(output.suggested_action, "create_file_first");
+    assert!(output.recovery_hint.contains("does not exist"));
+}
+
+/// Test: AmbiguousContext produces LLM-readable output
+#[test]
+fn test_llm_error_ambiguous_context() {
+    use apply_patch_mcp::error::PatchError;
+
+    let err = PatchError::AmbiguousContext {
+        path: "test.rs".to_string(),
+        count: 3,
+        match_positions: vec![10, 20, 30],
+        context_at_each: vec!["ctx1".to_string(), "ctx2".to_string(), "ctx3".to_string()],
+    };
+    let output = err.to_json();
+
+    assert_eq!(output.file, "test.rs");
+    assert_eq!(output.suggested_action, "add_unique_context");
+    assert!(output.recovery_hint.contains("3 matches"));
+}
+
+/// Test: Parse error produces LLM-readable output
+#[test]
+fn test_llm_error_parse() {
+    use apply_patch_mcp::error::PatchError;
+
+    let err = PatchError::Parse("Invalid patch format".to_string());
+    let output = err.to_json();
+
+    assert_eq!(output.suggested_action, "fix_patch_syntax");
+    assert!(output.recovery_hint.contains("Patch syntax error"));
+}
+
+/// Test: Path traversal error produces LLM-readable output
+#[test]
+fn test_llm_error_path_traversal() {
+    use apply_patch_mcp::error::PatchError;
+
+    let err = PatchError::PathTraversal("../etc/passwd".to_string());
+    let output = err.to_json();
+
+    assert_eq!(output.suggested_action, "use_relative_path");
+    assert!(output.recovery_hint.contains("directory traversal"));
+}
+
+/// Test: Symlink rejected error produces LLM-readable output
+#[test]
+fn test_llm_error_symlink_rejected() {
+    use apply_patch_mcp::error::PatchError;
+
+    let err = PatchError::SymlinkRejected("link.txt".to_string());
+    let output = err.to_json();
+
+    assert_eq!(output.suggested_action, "resolve_symlink");
+    assert!(output.recovery_hint.contains("symlink"));
+}
+
+/// Test: FileAlreadyExists error produces LLM-readable output
+#[test]
+fn test_llm_error_file_already_exists() {
+    use apply_patch_mcp::error::PatchError;
+
+    let err = PatchError::FileAlreadyExists("existing.txt".to_string());
+    let output = err.to_json();
+
+    assert_eq!(output.suggested_action, "use_update_not_add");
+    assert!(output.recovery_hint.contains("already exists"));
+}
+/// Test: Threshold 0.0 accepts any valid fuzzy match (clamped minimum)
+/// Note: Fuzzy matching only triggers for patterns >= 3 lines
+#[test]
+fn test_threshold_0_0_accepts_any_similarity() {
+    let dir = tmp();
+
+    // Create a file with content
+    let file_path = dir.path().join("test.txt");
+    std::fs::write(&file_path, "alpha beta\ngamma delta\nepsilon zeta\n").unwrap();
+
+    // Create a patch with context lines that differ slightly
+    // Search pattern has 3 lines for fuzzy matching
+    let input = concat!(
+        "*** Begin Patch\n",
+        "*** Update File: test.txt\n",
+        "@@ alpha\n",
+        " alpha betA\n",   // 1 char diff - 93% similarity
+        "-gamma deltA\n",  // 1 char diff - 93% similarity
+        " epsilon zeTa\n", // 1 char diff - 93% similarity (3 lines = fuzzy trigger)
+        "+new content\n",
+        "*** End Patch\n"
+    );
+    let ops = parse_patch(input).unwrap();
+
+    // With threshold 0.0 (clamped), fuzzy matching accepts any similarity > 0
+    let result = apply_patch_with_threshold(ops, dir.path(), Some(0.0));
+    assert!(
+        result.operations[0].status == "ok",
+        "Expected patch to succeed with threshold 0.0 (accepts any match)"
+    );
+}
+
+/// Test: Negative threshold is clamped to 0.0
+#[test]
+fn test_negative_threshold_clamped_to_0() {
+    let dir = tmp();
+
+    // Create a file with content
+    let file_path = dir.path().join("test.txt");
+    std::fs::write(&file_path, "alpha beta\ngamma delta\nepsilon zeta\n").unwrap();
+
+    // Create a patch with context lines that differ slightly
+    // Search pattern has 3 lines for fuzzy matching
+    let input = concat!(
+        "*** Begin Patch\n",
+        "*** Update File: test.txt\n",
+        "@@ alpha\n",
+        " alpha betA\n",   // 1 char diff
+        "-gamma deltA\n",  // 1 char diff
+        " epsilon zeTa\n", // 1 char diff (3 lines = fuzzy trigger)
+        "+new content\n",
+        "*** End Patch\n"
+    );
+    let ops = parse_patch(input).unwrap();
+
+    // Negative threshold should be clamped to 0.0 and behave the same as 0.0
+    let result = apply_patch_with_threshold(ops, dir.path(), Some(-0.5));
+    assert!(
+        result.operations[0].status == "ok",
+        "Expected patch to succeed with negative threshold (clamped to 0.0)"
+    );
+}
+
+/// Test: Threshold above 1.0 is clamped to 1.0 (100% similarity required)
+#[test]
+fn test_threshold_above_1_clamped_to_1() {
+    let dir = tmp();
+
+    // Create a file with 3+ lines for fuzzy matching
+    let file_path = dir.path().join("test.txt");
+    std::fs::write(&file_path, "alpha beta\ngamma delta\nepsilon zeta\n").unwrap();
+
+    // Create a patch with context that doesn't match 100%
+    // Search pattern has 3 lines for fuzzy matching
+    let input = concat!(
+        "*** Begin Patch\n",
+        "*** Update File: test.txt\n",
+        "@@ alpha\n",
+        " alpha betA\n",   // 1 char diff - 93% similarity
+        "-gamma delta\n",  // Exact match
+        " epsilon zeta\n", // Exact match (3 lines = fuzzy trigger)
+        "+new content\n",
+        "*** End Patch\n"
+    );
+    let ops = parse_patch(input).unwrap();
+
+    // Threshold 2.0 is clamped to 1.0, requiring 100% similarity
+    // One char difference makes similarity < 100%, so fuzzy match fails
+    let result = apply_patch_with_threshold(ops, dir.path(), Some(2.0));
+    assert!(
+        result.operations[0].status == "error",
+        "Expected patch to fail with threshold 2.0 (clamped to 1.0, requires 100% similarity)"
+    );
 }

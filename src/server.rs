@@ -18,6 +18,11 @@ pub struct BatchExecParams {
         description = "V4A patch text containing Read, Add, Update, Delete operations. Wrap in *** Begin Patch / *** End Patch."
     )]
     pub patch: String,
+
+    #[schemars(
+        description = "Optional fuzzy matching threshold (0.0-1.0). Higher values (e.g., 0.97) require stricter matching. Default: 0.97."
+    )]
+    pub threshold: Option<f32>,
 }
 
 #[derive(Clone)]
@@ -35,7 +40,9 @@ impl ApplyPatchServer {
 
     #[tool(
         name = "batch__exec",
-        description = "Unified workspace tool: read, map, add, update, and delete files atomically.\nVersion: 1.0.4\n\nFORMAT: wrap everything in *** Begin Patch / *** End Patch.\n\nEXAMPLES:\n\n1. Read a file:\n  *** Begin Patch\n  *** Read File: src/main.rs\n  *** End Patch\n\n2. Read with symbols:\n  *** Begin Patch\n  *** Read File: src/lib.rs symbols=Server,handle_request language=rust\n  *** End Patch\n\n3. Read with line range:\n  *** Begin Patch\n  *** Read File: config.py offset=10 limit=50\n  *** End Patch\n\n4. Map a directory:\n  *** Begin Patch\n  *** Map Directory: src/ depth=2\n  *** End Patch\n\n5. Add a new file:\n  *** Begin Patch\n  *** Add File: src/hello.rs\n  +pub fn hello() { println!(\\\"Hello!\\\"); }\n  *** End Patch\n\n6. Update a file:\n  *** Begin Patch\n  *** Update File: src/lib.rs\n  @@ fn main\n   fn main() {\n  -    old_code();\n  +    new_code();\n   }\n  *** End Patch\n\n7. Update with multiple hunks:\n  *** Begin Patch\n  *** Update File: src/lib.rs\n  @@ fn setup\n   fn setup() {\n  -    old_init();\n  +    new_init();\n   }\n  @@ fn teardown\n   fn teardown() {\n  -    old_cleanup();\n  +    new_cleanup();\n   }\n  *** End Patch\n\n8. Rename a file:\n  *** Begin Patch\n  *** Update File: src/old.rs\n  *** Move to: src/new.rs\n  @@ fn foo\n   fn foo() { ... }\n  *** End Patch\n\n9. Delete a file:\n  *** Begin Patch\n  *** Delete File: src/old.rs\n  *** End Patch\n\n10. Combined operations:\n  *** Begin Patch\n  *** Read File: src/main.rs\n  *** Update File: src/lib.rs\n  @@ fn main\n   fn main() {\n  -    old();\n  +    new();\n   }\n  *** Add File: src/greet.rs\n  +pub fn greet() { println!(\\\"hi\\\"); }\n  *** Delete File: src/deprecated.rs\n  *** End Patch\n\nOPTIONS:\n  *** Read File: <path> [symbols=a,b] [language=rust] [offset=N] [limit=N]\n  *** Map Directory: <path> [depth=N] [limit=N]  (default: depth=3, limit=6000)\n  *** Update File: <path>   @@ hint (optional)   context/ -/ + lines\n  *** Add File: <path>      +content lines\n  *** Delete File: <path>   no body needed\n  *** Move to: <path>       (inside Update, renames file)\n\nSECURITY: No path traversal (../), no symlinks, no absolute paths.\nERRORS: JSON with structured diagnostics. ContextNotFound includes closest_matches.\nVALIDATORS (advisory): rustfmt, gofmt, py_compile, json.tool, bash -n, node --check"
+        description = "Unified workspace tool: read, map, add, update, and delete files atomically.\nVersion: 1.0.4\n\nFORMAT: wrap everything in *** Begin Patch / *** End Patch.\n\nEXAMPLES:\n\n1. Read a file:\n  *** Begin Patch\n  *** Read File: src/main.rs\n  *** End Patch\n\n2. Read with symbols:\n  *** Begin Patch\n  *** Read File: src/lib.rs symbols=Server,handle_request language=rust\n  *** End Patch\n\n3. Read with line range:\n  *** Begin Patch\n  *** Read File: config.py offset=10 limit=50\n  *** End Patch\n\n4. Map a directory:\n  *** Begin Patch\n  *** Map Directory: src/ depth=2\n  *** End Patch\n\n5. Add a new file:\n  *** Begin Patch\n  *** Add File: src/hello.rs\n  +pub fn hello() { println!(\\\"Hello!\\\"); }\n  *** End Patch\n\n6. Update a file:\n  *** Begin Patch\n  *** Update File: src/lib.rs\n  @@ fn main\n   fn main() {\n  -    old_code();\n  +    new_code();\n   }\n  *** End Patch\n\n7. Update with multiple hunks:\n  *** Begin Patch\n  *** Update File: src/lib.rs\n  @@ fn setup\n   fn setup() {\n  -    old_init();\n  +    new_init();\n   }\n  @@ fn teardown\n   fn teardown() {\n  -    old_cleanup();\n  +    new_cleanup();\n   }\n  *** End Patch\n\n8. Rename a file:\n  *** Begin Patch\n  *** Update File: src/old.rs\n  *** Move to: src/new.rs\n  @@ fn foo\n   fn foo() { ... }\n  *** End Patch\n\n9. Delete a file:\n  *** Begin Patch\n  *** Delete File: src/old.rs\n  *** End Patch\n\n10. Combined operations:\n  *** Begin Patch\n  *** Read File: src/main.rs\n  *** Update File: src/lib.rs\n  @@ fn main\n   fn main() {\n  -    old();\n  +    new();\n   }\n  *** Add File: src/greet.rs\n  +pub fn greet() { println!(\\\"hi\\\"); }\n  *** Delete File: src/deprecated.rs\n  *** End Patch\n\nOPTIONS:\n  *** Read File: <path> [symbols=a,b] [language=rust] [offset=N] [limit=N]\n  *** Map Directory: <path> [depth=N] [limit=N]  (default: depth=3, limit=6000)\n  *** Update File: <path>   @@ hint (optional)   context/ -/ + lines\n  *** Add File: <path>      +content lines\n  *** Delete File: <path>   no body needed\n  *** Move to: <path>       (inside Update, renames file)\n\nSECURITY: No path traversal (../), no symlinks, no absolute paths.
+
+VALIDATORS: rustfmt, gofmt, py_compile, json.tool, bash -n, node --check, terraform fmt (advisory)."
     )]
     async fn exec(
         &self,
@@ -185,7 +192,7 @@ impl ApplyPatchServer {
         }
 
         // Execute Write operations (add/update/delete)
-        let result = applier::apply_patch(write_ops, &base_dir);
+        let result = applier::apply_patch_with_threshold(write_ops, &base_dir, params.threshold);
 
         let has_error = result.operations.iter().any(|op| op.status == "error");
 
@@ -197,9 +204,7 @@ impl ApplyPatchServer {
                 .map(|op| {
                     format!(
                         "[ERROR] {} \u{2014} {}: {}",
-                        op.op_type,
-                        op.path,
-                        op.message
+                        op.op_type, op.path, op.message
                     )
                 })
                 .collect::<Vec<_>>()
