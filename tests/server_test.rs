@@ -239,13 +239,13 @@ fn batch_apply_patch_success() {
     let dir = tmp();
     fs::write(dir.path().join("test.txt"), "old content").unwrap();
 
-    let patch = r#"*** Begin Patch
-*** Update File: test.txt
+    let patch = r#"=== begin
+update test.txt
   old content
 +new line
-*** End Patch"#;
+=== end"#;
 
-    let ops = parse_patch(patch).unwrap();
+    let ops = parse_patch(patch).unwrap().ops;
     let result = apply_patch(ops, dir.path());
 
     assert_eq!(
@@ -270,13 +270,13 @@ fn batch_apply_error_returns_structured_result() {
     fs::write(dir.path().join("test.txt"), "wrong content").unwrap();
 
     // Patch context doesn't match file
-    let patch = r#"*** Begin Patch
-*** Update File: test.txt
+    let patch = r#"=== begin
+update test.txt
   nonexistent context
 +new line
-*** End Patch"#;
+=== end"#;
 
-    let ops = parse_patch(patch).unwrap();
+    let ops = parse_patch(patch).unwrap().ops;
     let result = apply_patch(ops, dir.path());
 
     assert_eq!(
@@ -292,9 +292,9 @@ fn batch_apply_error_returns_structured_result() {
 #[test]
 fn batch_empty_patch_no_operations() {
     // Valid format but no operations
-    let patch = "*** Begin Patch\n*** End Patch";
+    let patch = "=== begin\n=== end";
 
-    let ops = parse_patch(patch).unwrap();
+    let ops = parse_patch(patch).unwrap().ops;
     assert!(ops.is_empty(), "Should return empty operations");
 }
 
@@ -305,16 +305,16 @@ fn batch_multi_file_atomic_all_or_nothing() {
     fs::write(dir.path().join("file2.txt"), "content2").unwrap();
 
     // One valid update, one invalid (context mismatch)
-    let patch = r#"*** Begin Patch
-*** Update File: file1.txt
+    let patch = r#"=== begin
+update file1.txt
   content1
 +added1
-*** Update File: file2.txt
+update file2.txt
   wrong context
 +added2
-*** End Patch"#;
+=== end"#;
 
-    let ops = parse_patch(patch).unwrap();
+    let ops = parse_patch(patch).unwrap().ops;
     let result = apply_patch(ops, dir.path());
 
     // Both should fail due to atomic behavior
@@ -354,13 +354,13 @@ fn server_capabilities_available() {
 fn batch_add_file_success() {
     let dir = tmp();
 
-    let patch = r#"*** Begin Patch
-*** Add File: newfile.txt
+    let patch = r#"=== begin
+create newfile.txt
 +line1
 +line2
-*** End Patch"#;
+=== end"#;
 
-    let ops = parse_patch(patch).unwrap();
+    let ops = parse_patch(patch).unwrap().ops;
     let result = apply_patch(ops, dir.path());
 
     assert_eq!(
@@ -384,11 +384,11 @@ fn batch_delete_file_success() {
     let dir = tmp();
     fs::write(dir.path().join("todelete.txt"), "content").unwrap();
 
-    let patch = r#"*** Begin Patch
-*** Delete File: todelete.txt
-*** End Patch"#;
+    let patch = r#"=== begin
+delete todelete.txt
+=== end"#;
 
-    let ops = parse_patch(patch).unwrap();
+    let ops = parse_patch(patch).unwrap().ops;
     let result = apply_patch(ops, dir.path());
 
     assert_eq!(
@@ -409,13 +409,13 @@ fn batch_move_file_success() {
     let dir = tmp();
     fs::write(dir.path().join("old.txt"), "content").unwrap();
 
-    let patch = r#"*** Begin Patch
-*** Update File: old.txt
-*** Move to: new.txt
+    let patch = r#"=== begin
+update old.txt
+move_to new.txt
   content
-*** End Patch"#;
+=== end"#;
 
-    let ops = parse_patch(patch).unwrap();
+    let ops = parse_patch(patch).unwrap().ops;
     let _result = apply_patch(ops, dir.path());
 
     // Move may be supported; check file state

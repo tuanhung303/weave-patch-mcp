@@ -19,17 +19,17 @@ fn test_hint_disambiguates_identical_code() {
     .unwrap();
 
     let input = concat!(
-        "*** Begin Patch\n",
-        "*** Update File: multi.py\n",
+        "=== begin\n",
+        "update multi.py\n",
         "@@ def function_b\n",
         "      x = 1\n",
         "      print(\"hello\")\n",
         "-    return x\n",
         "+    return x + 1\n",
-        "*** End Patch",
+        "=== end",
     );
 
-    let ops = parse_patch(input).unwrap();
+    let ops = parse_patch(input).unwrap().ops;
     let result = apply_patch(ops, dir.path());
     assert_eq!(
         result.operations[0].status, "ok",
@@ -66,8 +66,8 @@ fn test_py_nested_indentation_patch() {
     .unwrap();
 
     let input = concat!(
-        "*** Begin Patch\n",
-        "*** Update File: nested.py\n",
+        "=== begin\n",
+        "update nested.py\n",
         "@@ def process(data):\n",
         "      if data:\n",
         "          if data.get(\"key\"):\n",
@@ -75,10 +75,10 @@ fn test_py_nested_indentation_patch() {
         "-            print(f\"Found: {result}\")\n",
         "+            print(f\"Value: {result}\")\n",
         "              return result\n",
-        "*** End Patch",
+        "=== end",
     );
 
-    let ops = parse_patch(input).unwrap();
+    let ops = parse_patch(input).unwrap().ops;
     let result = apply_patch(ops, dir.path());
     assert_eq!(
         result.operations[0].status, "ok",
@@ -121,16 +121,16 @@ fn test_crlf_line_endings_patch() {
     .unwrap();
 
     let input = concat!(
-        "*** Begin Patch\n",
-        "*** Update File: crlf.py\n",
+        "=== begin\n",
+        "update crlf.py\n",
         "  def greet():\n",
         "-    print(\"hello\")\n",
         "+    print(\"Hello, World!\")\n",
         "      return True\n",
-        "*** End Patch",
+        "=== end",
     );
 
-    let ops = parse_patch(input).unwrap();
+    let ops = parse_patch(input).unwrap().ops;
     let result = apply_patch(ops, dir.path());
     assert_eq!(
         result.operations[0].status, "ok",
@@ -161,16 +161,16 @@ fn test_context_not_found_has_diagnostics() {
     .unwrap();
 
     let input = concat!(
-        "*** Begin Patch\n",
-        "*** Update File: diagnostic.py\n",
+        "=== begin\n",
+        "update diagnostic.py\n",
         "@@ def bar\n",
         " nonexistent line\n",
         "-also missing\n",
         "+replacement\n",
-        "*** End Patch",
+        "=== end",
     );
 
-    let ops = parse_patch(input).unwrap();
+    let ops = parse_patch(input).unwrap().ops;
     let result = apply_patch(ops, dir.path());
     assert_eq!(
         result.operations[0].status, "error",
@@ -213,13 +213,9 @@ fn test_context_not_found_has_diagnostics() {
 fn patch_empty_file_creation() {
     let dir = tmp();
 
-    let input = concat!(
-        "*** Begin Patch\n",
-        "*** Add File: empty.txt\n",
-        "*** End Patch",
-    );
+    let input = concat!("=== begin\n", "create empty.txt\n", "=== end",);
 
-    let ops = parse_patch(input).unwrap();
+    let ops = parse_patch(input).unwrap().ops;
     let result = apply_patch(ops, dir.path());
 
     assert_eq!(
@@ -246,16 +242,16 @@ fn patch_unicode_content_preserved() {
     fs::write(dir.path().join("unicode.txt"), original).unwrap();
 
     let input = concat!(
-        "*** Begin Patch\n",
-        "*** Update File: unicode.txt\n",
+        "=== begin\n",
+        "update unicode.txt\n",
         "  Hello 世界! 🌍\n",
         "-Привет мир\n",
         "+Bonjour monde\n",
         "  السلام عليكم\n",
-        "*** End Patch",
+        "=== end",
     );
 
-    let ops = parse_patch(input).unwrap();
+    let ops = parse_patch(input).unwrap().ops;
     let result = apply_patch(ops, dir.path());
 
     assert_eq!(
@@ -293,11 +289,11 @@ fn patch_very_long_lines_handled() {
 
     let replacement = format!("{}REPLACEMENT{}", long_prefix, long_suffix);
     let patch = format!(
-        "*** Begin Patch\n*** Update File: longlines.txt\n-{}\n+{}\n*** End Patch",
+        "=== begin\nupdate longlines.txt\n-{}\n+{}\n=== end",
         target, replacement
     );
 
-    let ops = parse_patch(&patch).unwrap();
+    let ops = parse_patch(&patch).unwrap().ops;
     let result = apply_patch(ops, dir.path());
 
     assert_eq!(
@@ -322,30 +318,30 @@ fn sequential_patch_same_file() {
 
     // Create multiple patches targeting the same file
     let patch1 = concat!(
-        "*** Begin Patch\n",
-        "*** Update File: concurrent.txt\n",
+        "=== begin\n",
+        "update concurrent.txt\n",
         "  original\n",
         "+patch1 line\n",
-        "*** End Patch",
+        "=== end",
     );
 
     let patch2 = concat!(
-        "*** Begin Patch\n",
-        "*** Update File: concurrent.txt\n",
+        "=== begin\n",
+        "update concurrent.txt\n",
         "  original\n",
         "+patch2 line\n",
-        "*** End Patch",
+        "=== end",
     );
 
     // Apply both patches sequentially (simulating concurrent access pattern)
-    let ops1 = parse_patch(patch1).unwrap();
+    let ops1 = parse_patch(patch1).unwrap().ops;
     let _result1 = apply_patch(ops1, dir.path());
 
     // After first patch, the content should be different
     let _content1 = fs::read_to_string(dir.path().join("concurrent.txt")).unwrap();
 
     // Second patch should fail because context "original" no longer exists
-    let ops2 = parse_patch(patch2).unwrap();
+    let ops2 = parse_patch(patch2).unwrap().ops;
     let _result2 = apply_patch(ops2, dir.path());
 
     // One should succeed, one might fail depending on timing
@@ -385,14 +381,14 @@ fn patch_read_only_file_handling() {
     fs::set_permissions(&path, perms).unwrap();
 
     let input = concat!(
-        "*** Begin Patch\n",
-        "*** Update File: readonly.txt\n",
+        "=== begin\n",
+        "update readonly.txt\n",
         "  content\n",
         "+new line\n",
-        "*** End Patch",
+        "=== end",
     );
 
-    let ops = parse_patch(input).unwrap();
+    let ops = parse_patch(input).unwrap().ops;
     let result = apply_patch(ops, dir.path());
 
     // The behavior depends on the OS and user permissions:
@@ -442,17 +438,17 @@ fn patch_multi_file_atomic_all_or_nothing() {
 
     // Valid update to file1, but invalid context for file2
     let input = concat!(
-        "*** Begin Patch\n",
-        "*** Update File: file1.txt\n",
+        "=== begin\n",
+        "update file1.txt\n",
         "  file1 content\n",
         "+added to file1\n",
-        "*** Update File: file2.txt\n",
+        "update file2.txt\n",
         "  wrong context\n",
         "+added to file2\n",
-        "*** End Patch",
+        "=== end",
     );
 
-    let ops = parse_patch(input).unwrap();
+    let ops = parse_patch(input).unwrap().ops;
     let result = apply_patch(ops, dir.path());
 
     // Entire patch should fail due to context mismatch on file2
@@ -471,7 +467,7 @@ fn patch_multi_file_atomic_all_or_nothing() {
 }
 
 /// Test: Unified patch format with Read + Write operations
-/// This tests the new *** Read File: syntax embedded in patches
+/// This tests the new read syntax embedded in patches
 #[test]
 fn test_unified_read_write_patch() {
     let dir = tmp();
@@ -490,18 +486,18 @@ fn test_unified_read_write_patch() {
 
     // Parse a patch that reads then updates
     let input = concat!(
-        "*** Begin Patch\n",
-        "*** Read File: main.rs\n",
-        "*** Update File: lib.rs\n",
+        "=== begin\n",
+        "read main.rs\n",
+        "update lib.rs\n",
         "@@ pub fn helper\n",
         " pub fn helper() -> i32 {\n",
         "-    42\n",
         "+    100\n",
         " }\n",
-        "*** End Patch",
+        "=== end",
     );
 
-    let ops = parse_patch(input).unwrap();
+    let ops = parse_patch(input).unwrap().ops;
     assert_eq!(ops.len(), 2, "Should have 2 operations: Read + Update");
 
     // Verify first op is Read
@@ -549,18 +545,18 @@ fn test_mixed_operations_in_patch() {
     fs::write(dir.path().join("delete.txt"), "Delete me\n").unwrap();
 
     let input = concat!(
-        "*** Begin Patch\n",
-        "*** Read File: keep.txt\n",
-        "*** Add File: new.txt\n",
+        "=== begin\n",
+        "read keep.txt\n",
+        "create new.txt\n",
         "+New file content\n",
-        "*** Update File: update.txt\n",
+        "update update.txt\n",
         "-Old content\n",
         "+Updated content\n",
-        "*** Delete File: delete.txt\n",
-        "*** End Patch",
+        "delete delete.txt\n",
+        "=== end",
     );
 
-    let ops = parse_patch(input).unwrap();
+    let ops = parse_patch(input).unwrap().ops;
     assert_eq!(ops.len(), 4);
 
     let result = apply_patch(ops, dir.path());
@@ -600,16 +596,16 @@ fn test_word_boundary_hint_matching() {
 
     // Test 1: @@ def foo$ should match 'def foo():' but not 'def foo_bar():'
     let input = concat!(
-        "*** Begin Patch\n",
-        "*** Update File: functions.py\n",
+        "=== begin\n",
+        "update functions.py\n",
         "@@ def foo$\n",
         " def foo():\n",
         "-    return 1\n",
         "+    return 10\n",
-        "*** End Patch",
+        "=== end",
     );
 
-    let ops = parse_patch(input).unwrap();
+    let ops = parse_patch(input).unwrap().ops;
     let result = apply_patch(ops, dir.path());
     assert_eq!(
         result.operations[0].status, "ok",
@@ -644,16 +640,16 @@ fn test_word_boundary_hint_matching() {
     // Actually without $ it matches any line containing 'def foo', so it could match foo_bar
     // Let's verify that $ makes it specific
     let input2 = concat!(
-        "*** Begin Patch\n",
-        "*** Update File: functions.py\n",
+        "=== begin\n",
+        "update functions.py\n",
         "@@ def foo_bar$\n",
         " def foo_bar():\n",
         "-    return 2\n",
         "+    return 20\n",
-        "*** End Patch",
+        "=== end",
     );
 
-    let ops2 = parse_patch(input2).unwrap();
+    let ops2 = parse_patch(input2).unwrap().ops;
     let result2 = apply_patch(ops2, dir.path());
     assert_eq!(
         result2.operations[0].status, "ok",
@@ -688,16 +684,16 @@ fn test_parallel_patch_multiple_files() {
     }
 
     // Create a patch that updates all 10 files
-    let mut patch_lines = vec!["*** Begin Patch".to_string()];
+    let mut patch_lines = vec!["=== begin".to_string()];
     for i in 0..10 {
-        patch_lines.push(format!("*** Update File: file{}.txt", i));
+        patch_lines.push(format!("update file{}.txt", i));
         patch_lines.push(format!("  content {}", i));
         patch_lines.push(format!("+new line {}", i));
     }
-    patch_lines.push("*** End Patch".to_string());
+    patch_lines.push("=== end".to_string());
 
     let input = patch_lines.join("\n");
-    let ops = parse_patch(&input).unwrap();
+    let ops = parse_patch(&input).unwrap().ops;
     assert_eq!(ops.len(), 10, "Should have 10 update operations");
 
     let result = apply_patch(ops, dir.path());
@@ -730,16 +726,16 @@ fn test_conflict_add_update_same_path() {
 
     // Try to Add and Update the same file in one patch
     let input = concat!(
-        "*** Begin Patch\n",
-        "*** Add File: conflict.txt\n",
+        "=== begin\n",
+        "create conflict.txt\n",
         "+new content\n",
-        "*** Update File: conflict.txt\n",
+        "update conflict.txt\n",
         "-old content\n",
         "+updated content\n",
-        "*** End Patch",
+        "=== end",
     );
 
-    let ops = parse_patch(input).unwrap();
+    let ops = parse_patch(input).unwrap().ops;
     let result = apply_patch(ops, dir.path());
 
     // Should have an error due to conflict
@@ -769,16 +765,16 @@ fn test_threshold_default_rejects_low_similarity() {
 
     // Try to update with context that's similar but not 97% match
     let input = concat!(
-        "*** Begin Patch\n",
-        "*** Update File: test.txt\n",
+        "=== begin\n",
+        "update test.txt\n",
         "@@ line one\n",
         " line ONE\n", // Changed case - ~75% similarity
         "-line two\n",
         "+line TWO\n",
-        "*** End Patch",
+        "=== end",
     );
 
-    let ops = parse_patch(input).unwrap();
+    let ops = parse_patch(input).unwrap().ops;
     let result = apply_patch(ops, dir.path());
 
     // Should fail because similarity is below 97%
@@ -806,17 +802,17 @@ fn test_threshold_low_accepts_medium_similarity() {
     // Pattern needs >= 3 lines to trigger fuzzy matching
     // Lines differ by 1-2 characters each - fails normalized match, passes fuzzy
     let input = concat!(
-        "*** Begin Patch\n",
-        "*** Update File: test.txt\n",
+        "=== begin\n",
+        "update test.txt\n",
         "@@ alpha\n",
         " alpha betA\n",   // 1 char diff (A vs a) - 93% similarity
         "-gamma deltA\n",  // 1 char diff (A vs a) - 93% similarity
         " epsilon zeTa\n", // 1 char diff (T vs t) - 93% similarity
         "+new content\n",
-        "*** End Patch",
+        "=== end",
     );
 
-    let ops = parse_patch(input).unwrap();
+    let ops = parse_patch(input).unwrap().ops;
     let result = apply_patch_with_threshold(ops, dir.path(), Some(0.80));
 
     // With threshold 0.80, fuzzy matching should accept ~93% similarity
@@ -840,17 +836,17 @@ fn test_threshold_1_0_requires_exact() {
     // Pattern with >= 3 lines to trigger fuzzy matching
     // One char difference ensures < 100% similarity
     let input = concat!(
-        "*** Begin Patch\n",
-        "*** Update File: test.txt\n",
+        "=== begin\n",
+        "update test.txt\n",
         "@@ alpha\n",
         " alpha betA\n",   // 1 char diff (A vs a) - 93% similarity
         "-gamma delta\n",  // Exact match
         " epsilon zeta\n", // Exact match (3rd line ensures fuzzy)
         "+new content\n",
-        "*** End Patch",
+        "=== end",
     );
 
-    let ops = parse_patch(input).unwrap();
+    let ops = parse_patch(input).unwrap().ops;
     let result = apply_patch_with_threshold(ops, dir.path(), Some(1.0));
 
     // With threshold 1.0, fuzzy match requires 100% similarity
@@ -889,16 +885,16 @@ fn test_llm_error_context_not_found() {
 
     // Try to update with non-existent context
     let input = concat!(
-        "*** Begin Patch\n",
-        "*** Update File: test.txt\n",
+        "=== begin\n",
+        "update test.txt\n",
         "@@ non existent context\n",
         " non existent context\n",
         "-old line\n",
         "+new line\n",
-        "*** End Patch",
+        "=== end",
     );
 
-    let ops = parse_patch(input).unwrap();
+    let ops = parse_patch(input).unwrap().ops;
     let result = apply_patch(ops, dir.path());
 
     // Should error
@@ -1000,16 +996,16 @@ fn test_threshold_0_0_accepts_any_similarity() {
     // Create a patch with context lines that differ slightly
     // Search pattern has 3 lines for fuzzy matching
     let input = concat!(
-        "*** Begin Patch\n",
-        "*** Update File: test.txt\n",
+        "=== begin\n",
+        "update test.txt\n",
         "@@ alpha\n",
         " alpha betA\n",   // 1 char diff - 93% similarity
         "-gamma deltA\n",  // 1 char diff - 93% similarity
         " epsilon zeTa\n", // 1 char diff - 93% similarity (3 lines = fuzzy trigger)
         "+new content\n",
-        "*** End Patch\n"
+        "=== end\n"
     );
-    let ops = parse_patch(input).unwrap();
+    let ops = parse_patch(input).unwrap().ops;
 
     // With threshold 0.0 (clamped), fuzzy matching accepts any similarity > 0
     let result = apply_patch_with_threshold(ops, dir.path(), Some(0.0));
@@ -1031,16 +1027,16 @@ fn test_negative_threshold_clamped_to_0() {
     // Create a patch with context lines that differ slightly
     // Search pattern has 3 lines for fuzzy matching
     let input = concat!(
-        "*** Begin Patch\n",
-        "*** Update File: test.txt\n",
+        "=== begin\n",
+        "update test.txt\n",
         "@@ alpha\n",
         " alpha betA\n",   // 1 char diff
         "-gamma deltA\n",  // 1 char diff
         " epsilon zeTa\n", // 1 char diff (3 lines = fuzzy trigger)
         "+new content\n",
-        "*** End Patch\n"
+        "=== end\n"
     );
-    let ops = parse_patch(input).unwrap();
+    let ops = parse_patch(input).unwrap().ops;
 
     // Negative threshold should be clamped to 0.0 and behave the same as 0.0
     let result = apply_patch_with_threshold(ops, dir.path(), Some(-0.5));
@@ -1062,16 +1058,16 @@ fn test_threshold_above_1_clamped_to_1() {
     // Create a patch with context that doesn't match 100%
     // Search pattern has 3 lines for fuzzy matching
     let input = concat!(
-        "*** Begin Patch\n",
-        "*** Update File: test.txt\n",
+        "=== begin\n",
+        "update test.txt\n",
         "@@ alpha\n",
         " alpha betA\n",   // 1 char diff - 93% similarity
         "-gamma delta\n",  // Exact match
         " epsilon zeta\n", // Exact match (3 lines = fuzzy trigger)
         "+new content\n",
-        "*** End Patch\n"
+        "=== end\n"
     );
-    let ops = parse_patch(input).unwrap();
+    let ops = parse_patch(input).unwrap().ops;
 
     // Threshold 2.0 is clamped to 1.0, requiring 100% similarity
     // One char difference makes similarity < 100%, so fuzzy match fails

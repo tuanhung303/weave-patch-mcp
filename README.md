@@ -1,6 +1,6 @@
 # apply-patch-mcp
 
-**v1.0** — Production-ready MCP server for structured file patching using V4A diffs.  
+**v2.0** — Production-ready MCP server for structured file patching using compact syntax.  
 One tool, five operations. Create, read, map, update, and delete files in a single atomic call.
 
 ## Why This Over Edit/Write?
@@ -92,47 +92,48 @@ Add to your config:
 
 One tool, one parameter (`patch`). Five operations available in a single atomic call.
 
-All patches are wrapped in `*** Begin Patch` / `*** End Patch` markers.
+All patches are wrapped in `=== begin` / `=== end` markers.
 
 ### 1. Read a file
 
 ```
-*** Begin Patch
-*** Read File: src/main.rs
-*** End Patch
+=== begin
+read src/main.rs
+=== end
 ```
 
 **Read with symbol extraction** (Rust, Python, TypeScript, JS, Go):
 ```
-*** Begin Patch
-*** Read File: src/lib.rs symbols=Server,handle_request language=rust
-*** End Patch
+=== begin
+read src/lib.rs symbols=Server,handle_request language=rust
+=== end
 ```
 
 **Read with line range**:
 ```
-*** Begin Patch
-*** Read File: config.py offset=10 limit=50
-*** End Patch
+=== begin
+read config.py offset=10 limit=50
+=== end
 ```
 
 
 **Read multiple files** (batch read):
 ```
-*** Begin Patch
-*** Read File: src/main.rs
-*** Read File: src/lib.rs
-*** Read File: src/config.rs
-*** End Patch
+=== begin
+read src/main.rs
+read src/lib.rs
+read src/config.rs
+=== end
 ```
+
 ### 2. Map a directory
 
 Scan directory structure recursively. Returns files with sizes, line counts, and function signatures (`name: start:end`) at depth 1-3. Skips `node_modules`, `.git`, `target`, binaries.
 
 ```
-*** Begin Patch
-*** Map Directory: src/ depth=2
-*** End Patch
+=== begin
+map src/ depth=2
+=== end
 ```
 
 Defaults: `depth=3`, `limit=6000` chars.
@@ -140,10 +141,10 @@ Defaults: `depth=3`, `limit=6000` chars.
 ### 3. Add a file
 
 ```
-*** Begin Patch
-*** Add File: src/hello.rs
+=== begin
+create src/hello.rs
 +pub fn hello() { println!("Hello!"); }
-*** End Patch
+=== end
 ```
 
 ### 4. Update a file
@@ -151,20 +152,20 @@ Defaults: `depth=3`, `limit=6000` chars.
 Context lines (space-prefixed) anchor the edit. `-` removes, `+` adds.
 
 ```
-*** Begin Patch
-*** Update File: src/lib.rs
+=== begin
+update src/lib.rs
 @@ impl Server
  pub fn handle(&self, req: Request) -> Response {
 -    self.old_handler(req)
 +    self.new_handler(req)
  }
-*** End Patch
+=== end
 ```
 
 **Multiple hunks in one file**:
 ```
-*** Begin Patch
-*** Update File: src/lib.rs
+=== begin
+update src/lib.rs
 @@ fn setup
  fn setup() {
 -    old_init();
@@ -175,71 +176,71 @@ Context lines (space-prefixed) anchor the edit. `-` removes, `+` adds.
 -    old_cleanup();
 +    new_cleanup();
  }
-*** End Patch
+=== end
 ```
 
 **Rename a file** (update + move):
 ```
-*** Begin Patch
-*** Update File: src/old.rs
-*** Move to: src/new.rs
+=== begin
+update src/old.rs
+move_to src/new.rs
 @@ fn foo
  fn foo() { ... }
-*** End Patch
+=== end
 ```
 
 **Update multiple files** (batch update):
 ```
-*** Begin Patch
-*** Update File: src/api.rs
+=== begin
+update src/api.rs
 @@ fn handle
  fn handle() {
 -    old();
 +    new();
  }
-*** Update File: src/db.rs
+update src/db.rs
 @@ fn connect
  fn connect() {
 -    let url = "old";
 +    let url = "new";
  }
-*** End Patch
+=== end
 ```
 
 ### 5. Delete a file
 
 ```
-*** Begin Patch
-*** Delete File: src/deprecated.rs
-*** End Patch
+=== begin
+delete src/deprecated.rs
+=== end
 ```
 
 
 **Delete multiple files** (batch delete):
 ```
-*** Begin Patch
-*** Delete File: src/deprecated1.rs
-*** Delete File: src/deprecated2.rs
-*** Delete File: src/deprecated3.rs
-*** End Patch
+=== begin
+delete src/deprecated1.rs
+delete src/deprecated2.rs
+delete src/deprecated3.rs
+=== end
 ```
 
 ### Combined: all operations in one call
 
 ```
-*** Begin Patch
-*** Read File: src/main.rs
-*** Map Directory: src/ depth=1
-*** Update File: src/lib.rs
+=== begin
+read src/main.rs
+map src/ depth=1
+update src/lib.rs
 @@ fn main
  fn main() {
 -    old();
 +    new();
  }
-*** Add File: src/greet.rs
+create src/greet.rs
 +pub fn greet() { println!("hi"); }
-*** Delete File: src/deprecated.rs
-*** End Patch
+delete src/deprecated.rs
+=== end
 ```
 
 Read operations execute first (safe/read-only), then write operations are applied atomically.
@@ -317,7 +318,7 @@ cargo test
 | `tests/integration_test.rs` | Core patch operations, edge cases (Unicode, empty files, long lines, concurrent shadow collision, multi-op atomicity, CRLF) |
 | `tests/server_test.rs` | MCP server, `batch__exec` (globs, line ranges, symbol extraction, patch operations, error handling) |
 | `tests/validator_test.rs` | All 7 language-specific advisory validators |
-| `src/parser.rs` (unit) | V4A patch parsing, auto-wrap missing markers, multi-file, hints, Read/Map specs |
+| `src/parser.rs` (unit) | Compact syntax patch parsing, auto-wrap missing markers, multi-file, hints, Read/Map specs |
 | `src/applier.rs` (unit) | Path validation, fuzzy matching, validators, diff generation, match info |
 | `src/reader.rs` (unit) | Line ranges, symbol extraction (Rust/Python/TS/Go), glob expansion |
 

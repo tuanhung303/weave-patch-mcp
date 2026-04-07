@@ -41,47 +41,62 @@ pub enum FileOp {
     },
 }
 
-pub fn parse_patch(input: &str) -> Result<Vec<FileOp>, PatchError> {
-    // Auto-wrap missing Begin/End Patch markers for forgiving parsing.
-    let has_begin = input.lines().any(|l| l.trim() == "*** Begin Patch");
-    let has_end = input.lines().any(|l| l.trim() == "*** End Patch");
+/// Result of parsing a patch with optional threshold from begin marker.
+#[derive(Debug)]
+pub struct ParseResult {
+    pub ops: Vec<FileOp>,
+    pub threshold: Option<f32>,
+}
+
+pub fn parse_patch(input: &str) -> Result<ParseResult, PatchError> {
+    // Auto-wrap missing begin/end markers for forgiving parsing.
+    let has_begin = input.lines().any(|l| l.trim().starts_with("=== begin"));
+    let has_end = input.lines().any(|l| l.trim() == "=== end");
     let has_ops = input.lines().any(|l| {
-        l.starts_with("*** Add File: ")
-            || l.starts_with("*** Update File: ")
-            || l.starts_with("*** Delete File: ")
-            || l.starts_with("*** Read File: ")
-            || l.starts_with("*** Map Directory: ")
+        l.starts_with("create ")
+            || l.starts_with("update ")
+            || l.starts_with("delete ")
+            || l.starts_with("read ")
+            || l.starts_with("map ")
     });
 
     let input = if !has_begin && has_ops {
-        format!("*** Begin Patch\n{input}")
+        format!("=== begin\n{input}")
     } else {
         input.to_string()
     };
     let input = if !has_end {
-        format!("{input}\n*** End Patch")
+        format!("{input}\n=== end")
     } else {
         input
     };
 
     let lines: Vec<&str> = input.lines().collect();
 
-    // Find Begin/End Patch boundaries
+    // Find begin/end boundaries and extract threshold
+    let begin_line = lines
+        .iter()
+        .find(|l| l.trim().starts_with("=== begin"))
+        .ok_or_else(|| PatchError::Parse("Missing '=== begin' marker".to_string()))?;
+
     let begin_idx = lines
         .iter()
-        .position(|l| l.trim() == "*** Begin Patch")
-        .ok_or_else(|| PatchError::Parse("Missing '*** Begin Patch' marker".to_string()))?;
+        .position(|l| l.trim().starts_with("=== begin"))
+        .ok_or_else(|| PatchError::Parse("Missing '=== begin' marker".to_string()))?;
 
     let end_idx = lines
         .iter()
-        .position(|l| l.trim() == "*** End Patch")
-        .ok_or_else(|| PatchError::Parse("Missing '*** End Patch' marker".to_string()))?;
+        .position(|l| l.trim() == "=== end")
+        .ok_or_else(|| PatchError::Parse("Missing '=== end' marker".to_string()))?;
 
     if end_idx <= begin_idx {
         return Err(PatchError::Parse(
-            "'*** End Patch' must come after '*** Begin Patch'".to_string(),
+            "'=== end' must come after '=== begin'".to_string(),
         ));
     }
+
+    // Parse threshold from begin line: "=== begin threshold=0.95"
+    let threshold = parse_threshold_from_begin(begin_line)?;
 
     let body_lines = &lines[begin_idx + 1..end_idx];
 
@@ -93,11 +108,11 @@ pub fn parse_patch(input: &str) -> Result<Vec<FileOp>, PatchError> {
         .iter()
         .enumerate()
         .filter(|(_, l)| {
-            l.starts_with("*** Add File: ")
-                || l.starts_with("*** Update File: ")
-                || l.starts_with("*** Delete File: ")
-                || l.starts_with("*** Read File: ")
-                || l.starts_with("*** Map Directory: ")
+            l.starts_with("create ")
+                || l.starts_with("update ")
+                || l.starts_with("delete ")
+                || l.starts_with("read ")
+                || l.starts_with("map ")
         })
         .map(|(i, _)| i)
         .collect();
@@ -112,14 +127,14 @@ pub fn parse_patch(input: &str) -> Result<Vec<FileOp>, PatchError> {
         let header = body_lines[op_start];
         let section = &body_lines[op_start + 1..op_end];
 
-        if let Some(path) = header.strip_prefix("*** Add File: ") {
+        if let Some(path) = header.strip_prefix("create ") {
             let path = path.trim().to_string();
             let content = parse_add_content(section);
             ops.push(FileOp::Add { path, content });
-        } else if let Some(path) = header.strip_prefix("*** Delete File: ") {
+        } else if let Some(path) = header.strip_prefix("delete ") {
             let path = path.trim().to_string();
             ops.push(FileOp::Delete { path });
-        } else if let Some(path) = header.strip_prefix("*** Update File: ") {
+        } else if let Some(path) = header.strip_prefix("update ") {
             let path = path.trim().to_string();
             let (hunks, move_to) = parse_update_section(section)?;
             ops.push(FileOp::Update {
@@ -127,7 +142,7 @@ pub fn parse_patch(input: &str) -> Result<Vec<FileOp>, PatchError> {
                 hunks,
                 move_to,
             });
-        } else if let Some(read_spec) = header.strip_prefix("*** Read File: ") {
+        } else if let Some(read_spec) = header.strip_prefix("read ") {
             let spec = parse_read_spec(read_spec);
             ops.push(FileOp::Read {
                 path: spec.path,
@@ -136,7 +151,7 @@ pub fn parse_patch(input: &str) -> Result<Vec<FileOp>, PatchError> {
                 offset: spec.offset,
                 limit: spec.limit,
             });
-        } else if let Some(map_spec) = header.strip_prefix("*** Map Directory: ") {
+        } else if let Some(map_spec) = header.strip_prefix("map ") {
             let spec = parse_map_spec(map_spec);
             ops.push(FileOp::Map {
                 path: spec.path,
@@ -146,7 +161,38 @@ pub fn parse_patch(input: &str) -> Result<Vec<FileOp>, PatchError> {
         }
     }
 
-    Ok(ops)
+    Ok(ParseResult { ops, threshold })
+}
+
+/// Parse threshold from begin line: "=== begin" or "=== begin threshold=0.95"
+fn parse_threshold_from_begin(line: &str) -> Result<Option<f32>, PatchError> {
+    let line = line.trim();
+    // Strip "=== begin" prefix
+    let rest = line
+        .strip_prefix("=== begin")
+        .ok_or_else(|| PatchError::Parse("Invalid begin marker".to_string()))?;
+
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return Ok(None);
+    }
+
+    // Look for threshold=X
+    for part in rest.split_whitespace() {
+        if let Some(val) = part.strip_prefix("threshold=") {
+            let parsed: f32 = val
+                .parse()
+                .map_err(|_| PatchError::Parse(format!("Invalid threshold value: '{val}'")))?;
+            if !(0.0..=1.0).contains(&parsed) {
+                return Err(PatchError::Parse(format!(
+                    "Threshold must be between 0.0 and 1.0, got {parsed}"
+                )));
+            }
+            return Ok(Some(parsed));
+        }
+    }
+
+    Ok(None)
 }
 
 pub struct MapSpec {
@@ -180,7 +226,12 @@ fn parse_map_spec(spec: &str) -> MapSpec {
 fn parse_add_content(lines: &[&str]) -> String {
     let mut content_lines: Vec<String> = Vec::new();
     for line in lines {
-        if let Some(rest) = line.strip_prefix('+') {
+        // Accept both "+line" and "  +line" (optional indentation)
+        if let Some(rest) = line
+            .strip_prefix('+')
+            .or_else(|| line.strip_prefix("  +"))
+            .or_else(|| line.strip_prefix("\t+"))
+        {
             content_lines.push(rest.to_string());
         }
     }
@@ -191,7 +242,7 @@ fn parse_add_content(lines: &[&str]) -> String {
     }
 }
 
-/// Parsed read file specification from `*** Read File:` header.
+/// Parsed read file specification from `read` header.
 pub struct ReadSpec {
     pub path: String,
     pub symbols: Option<Vec<String>>,
@@ -200,7 +251,7 @@ pub struct ReadSpec {
     pub limit: Option<usize>,
 }
 
-/// Parse a Read File specification: "*** Read File: <path> [symbols=a,b] [language=rust] [offset=0] [limit=100]"
+/// Parse a Read specification: "read <path> [symbols=a,b] [language=rust] [offset=0] [limit=100]"
 fn parse_read_spec(spec: &str) -> ReadSpec {
     // Split by whitespace to separate path from key=value params
     let parts: Vec<&str> = spec.split_whitespace().collect();
@@ -242,7 +293,8 @@ fn parse_update_section(lines: &[&str]) -> Result<(Vec<Hunk>, Option<String>), P
     let mut current_hunk: Option<Hunk> = None;
 
     for &line in lines {
-        if let Some(dest) = line.strip_prefix("*** Move to: ") {
+        // Move directive: "move_to dest/path.rs"
+        if let Some(dest) = line.strip_prefix("move_to ") {
             move_to = Some(dest.trim().to_string());
             continue;
         }
@@ -254,7 +306,9 @@ fn parse_update_section(lines: &[&str]) -> Result<(Vec<Hunk>, Option<String>), P
             continue;
         }
 
-        if let Some(hint_part) = line.strip_prefix("@@") {
+        // Accept @@ with optional leading whitespace
+        let trimmed = line.trim();
+        if let Some(hint_part) = trimmed.strip_prefix("@@") {
             // Flush current hunk
             if let Some(hunk) = current_hunk.take() {
                 hunks.push(hunk);
@@ -272,9 +326,22 @@ fn parse_update_section(lines: &[&str]) -> Result<(Vec<Hunk>, Option<String>), P
             continue;
         }
 
-        // Parse diff lines
-        let diff_line = if let Some(rest) = line.strip_prefix("  ") {
-            // Space prefix (two spaces — one for the format, one for the actual content)
+        // Parse diff lines - check for +/- FIRST before context
+        // Order matters: check prefixed +/- before plain context
+        let diff_line = if let Some(rest) = line.strip_prefix("  -") {
+            // Two-space then minus (indented remove)
+            Some(DiffLine::Remove(rest.to_string()))
+        } else if let Some(rest) = line.strip_prefix("  +") {
+            // Two-space then plus (indented add)
+            Some(DiffLine::Add(rest.to_string()))
+        } else if let Some(rest) = line.strip_prefix('-') {
+            // Plain remove
+            Some(DiffLine::Remove(rest.to_string()))
+        } else if let Some(rest) = line.strip_prefix('+') {
+            // Plain add
+            Some(DiffLine::Add(rest.to_string()))
+        } else if let Some(rest) = line.strip_prefix("  ") {
+            // Two-space prefix (context)
             Some(DiffLine::Context(rest.to_string()))
         } else if line.starts_with(' ') && line.len() > 1 {
             // Single space prefix
@@ -282,11 +349,8 @@ fn parse_update_section(lines: &[&str]) -> Result<(Vec<Hunk>, Option<String>), P
         } else if line == " " || line == "  " {
             // Empty context line
             Some(DiffLine::Context(String::new()))
-        } else if let Some(rest) = line.strip_prefix('-') {
-            Some(DiffLine::Remove(rest.to_string()))
         } else {
-            line.strip_prefix('+')
-                .map(|rest| DiffLine::Add(rest.to_string()))
+            None
         };
 
         if let Some(dl) = diff_line {
@@ -317,10 +381,26 @@ mod tests {
 
     #[test]
     fn test_parse_add_file() {
-        let input = "*** Begin Patch\n*** Add File: src/hello.rs\n+fn hello() {\n+    println!(\"Hello\");\n+}\n*** End Patch";
-        let ops = parse_patch(input).unwrap();
-        assert_eq!(ops.len(), 1);
-        match &ops[0] {
+        let input =
+            "=== begin\ncreate src/hello.rs\n+fn hello() {\n+    println!(\"Hello\");\n+}\n=== end";
+        let result = parse_patch(input).unwrap();
+        assert_eq!(result.ops.len(), 1);
+        assert!(result.threshold.is_none());
+        match &result.ops[0] {
+            FileOp::Add { path, content } => {
+                assert_eq!(path, "src/hello.rs");
+                assert_eq!(content, "fn hello() {\n    println!(\"Hello\");\n}\n");
+            }
+            _ => panic!("Expected Add"),
+        }
+    }
+
+    #[test]
+    fn test_parse_add_file_indented() {
+        let input = "=== begin\ncreate src/hello.rs\n  +fn hello() {\n  +    println!(\"Hello\");\n  +}\n=== end";
+        let result = parse_patch(input).unwrap();
+        assert_eq!(result.ops.len(), 1);
+        match &result.ops[0] {
             FileOp::Add { path, content } => {
                 assert_eq!(path, "src/hello.rs");
                 assert_eq!(content, "fn hello() {\n    println!(\"Hello\");\n}\n");
@@ -331,10 +411,10 @@ mod tests {
 
     #[test]
     fn test_parse_delete_file() {
-        let input = "*** Begin Patch\n*** Delete File: src/old.rs\n*** End Patch";
-        let ops = parse_patch(input).unwrap();
-        assert_eq!(ops.len(), 1);
-        match &ops[0] {
+        let input = "=== begin\ndelete src/old.rs\n=== end";
+        let result = parse_patch(input).unwrap();
+        assert_eq!(result.ops.len(), 1);
+        match &result.ops[0] {
             FileOp::Delete { path } => assert_eq!(path, "src/old.rs"),
             _ => panic!("Expected Delete"),
         }
@@ -342,10 +422,11 @@ mod tests {
 
     #[test]
     fn test_parse_update_single_hunk() {
-        let input = "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n old_line\n-remove_me\n+add_me\n new_line\n*** End Patch";
-        let ops = parse_patch(input).unwrap();
-        assert_eq!(ops.len(), 1);
-        match &ops[0] {
+        let input =
+            "=== begin\nupdate src/lib.rs\n@@\n old_line\n-remove_me\n+add_me\n new_line\n=== end";
+        let result = parse_patch(input).unwrap();
+        assert_eq!(result.ops.len(), 1);
+        match &result.ops[0] {
             FileOp::Update {
                 path,
                 hunks,
@@ -367,9 +448,9 @@ mod tests {
 
     #[test]
     fn test_parse_update_multiple_hunks() {
-        let input = "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n ctx1\n-old1\n+new1\n@@ second\n ctx2\n-old2\n+new2\n*** End Patch";
-        let ops = parse_patch(input).unwrap();
-        match &ops[0] {
+        let input = "=== begin\nupdate src/lib.rs\n@@\n ctx1\n-old1\n+new1\n@@ second\n ctx2\n-old2\n+new2\n=== end";
+        let result = parse_patch(input).unwrap();
+        match &result.ops[0] {
             FileOp::Update { hunks, .. } => {
                 assert_eq!(hunks.len(), 2);
                 assert_eq!(hunks[0].context_hint, None);
@@ -381,9 +462,9 @@ mod tests {
 
     #[test]
     fn test_parse_update_with_context_hint() {
-        let input = "*** Begin Patch\n*** Update File: src/lib.rs\n@@ impl Server\n pub fn handle(&self) {\n-    old()\n+    new()\n }\n*** End Patch";
-        let ops = parse_patch(input).unwrap();
-        match &ops[0] {
+        let input = "=== begin\nupdate src/lib.rs\n@@ impl Server\n pub fn handle(&self) {\n-    old()\n+    new()\n }\n=== end";
+        let result = parse_patch(input).unwrap();
+        match &result.ops[0] {
             FileOp::Update { hunks, .. } => {
                 assert_eq!(hunks[0].context_hint, Some("impl Server".to_string()));
             }
@@ -393,19 +474,20 @@ mod tests {
 
     #[test]
     fn test_parse_multi_file_patch() {
-        let input = "*** Begin Patch\n*** Add File: a.rs\n+content\n*** Delete File: b.rs\n*** Update File: c.rs\n@@\n ctx\n-old\n+new\n*** End Patch";
-        let ops = parse_patch(input).unwrap();
-        assert_eq!(ops.len(), 3);
-        assert!(matches!(ops[0], FileOp::Add { .. }));
-        assert!(matches!(ops[1], FileOp::Delete { .. }));
-        assert!(matches!(ops[2], FileOp::Update { .. }));
+        let input = "=== begin\ncreate a.rs\n+content\ndelete b.rs\nupdate c.rs\n@@\n ctx\n-old\n+new\n=== end";
+        let result = parse_patch(input).unwrap();
+        assert_eq!(result.ops.len(), 3);
+        assert!(matches!(result.ops[0], FileOp::Add { .. }));
+        assert!(matches!(result.ops[1], FileOp::Delete { .. }));
+        assert!(matches!(result.ops[2], FileOp::Update { .. }));
     }
 
     #[test]
     fn test_parse_update_with_move_to() {
-        let input = "*** Begin Patch\n*** Update File: src/old.rs\n*** Move to: src/new.rs\n@@\n ctx\n-old\n+new\n*** End Patch";
-        let ops = parse_patch(input).unwrap();
-        match &ops[0] {
+        let input =
+            "=== begin\nupdate src/old.rs\nmove_to src/new.rs\n@@\n ctx\n-old\n+new\n=== end";
+        let result = parse_patch(input).unwrap();
+        match &result.ops[0] {
             FileOp::Update { path, move_to, .. } => {
                 assert_eq!(path, "src/old.rs");
                 assert_eq!(move_to.as_deref(), Some("src/new.rs"));
@@ -415,19 +497,19 @@ mod tests {
     }
 
     #[test]
-    fn test_error_missing_begin_patch_no_ops() {
-        // Input has no Begin Patch and no operation headers — still an error
-        let input = "some content\n*** End Patch";
+    fn test_error_missing_begin_no_ops() {
+        // Input has no begin and no operation headers — still an error
+        let input = "some content\n=== end";
         let result = parse_patch(input);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Begin Patch"));
+        assert!(result.unwrap_err().to_string().contains("begin"));
     }
 
     #[test]
     fn test_parse_hint_with_class() {
-        let input = "*** Begin Patch\n*** Update File: src/lib.rs\n@@ class Server\n pub struct Server {\n-    old_field: i32,\n+    new_field: i32,\n }\n*** End Patch";
-        let ops = parse_patch(input).unwrap();
-        match &ops[0] {
+        let input = "=== begin\nupdate src/lib.rs\n@@ class Server\n pub struct Server {\n-    old_field: i32,\n+    new_field: i32,\n }\n=== end";
+        let result = parse_patch(input).unwrap();
+        match &result.ops[0] {
             FileOp::Update { hunks, .. } => {
                 assert_eq!(hunks[0].context_hint, Some("class Server".to_string()));
             }
@@ -437,9 +519,9 @@ mod tests {
 
     #[test]
     fn test_parse_hint_with_punctuation() {
-        let input = "*** Begin Patch\n*** Update File: src/lib.rs\n@@ fn main():\n fn main() {\n-    old()\n+    new()\n }\n*** End Patch";
-        let ops = parse_patch(input).unwrap();
-        match &ops[0] {
+        let input = "=== begin\nupdate src/lib.rs\n@@ fn main():\n fn main() {\n-    old()\n+    new()\n }\n=== end";
+        let result = parse_patch(input).unwrap();
+        match &result.ops[0] {
             FileOp::Update { hunks, .. } => {
                 assert_eq!(hunks[0].context_hint, Some("fn main():".to_string()));
             }
@@ -449,9 +531,9 @@ mod tests {
 
     #[test]
     fn test_parse_indented_context() {
-        let input = "*** Begin Patch\n*** Update File: script.py\n@@\n def hello():\n     print(\"hi\")\n-    old_call()\n+    new_call()\n     return\n*** End Patch";
-        let ops = parse_patch(input).unwrap();
-        match &ops[0] {
+        let input = "=== begin\nupdate script.py\n@@\n def hello():\n     print(\"hi\")\n-    old_call()\n+    new_call()\n     return\n=== end";
+        let result = parse_patch(input).unwrap();
+        match &result.ops[0] {
             FileOp::Update { hunks, .. } => {
                 let ctx = &hunks[0].lines[1];
                 assert!(matches!(ctx, DiffLine::Context(s) if s.contains("print")));
@@ -462,10 +544,10 @@ mod tests {
 
     #[test]
     fn test_parse_read_file_basic() {
-        let input = "*** Begin Patch\n*** Read File: src/main.rs\n*** End Patch";
-        let ops = parse_patch(input).unwrap();
-        assert_eq!(ops.len(), 1);
-        match &ops[0] {
+        let input = "=== begin\nread src/main.rs\n=== end";
+        let result = parse_patch(input).unwrap();
+        assert_eq!(result.ops.len(), 1);
+        match &result.ops[0] {
             FileOp::Read {
                 path,
                 symbols,
@@ -485,9 +567,9 @@ mod tests {
 
     #[test]
     fn test_parse_read_file_with_symbols() {
-        let input = "*** Begin Patch\n*** Read File: src/lib.rs symbols=Server,handle language=rust\n*** End Patch";
-        let ops = parse_patch(input).unwrap();
-        match &ops[0] {
+        let input = "=== begin\nread src/lib.rs symbols=Server,handle language=rust\n=== end";
+        let result = parse_patch(input).unwrap();
+        match &result.ops[0] {
             FileOp::Read {
                 path,
                 symbols,
@@ -507,9 +589,9 @@ mod tests {
 
     #[test]
     fn test_parse_read_file_with_offset_limit() {
-        let input = "*** Begin Patch\n*** Read File: config.py offset=10 limit=50\n*** End Patch";
-        let ops = parse_patch(input).unwrap();
-        match &ops[0] {
+        let input = "=== begin\nread config.py offset=10 limit=50\n=== end";
+        let result = parse_patch(input).unwrap();
+        match &result.ops[0] {
             FileOp::Read {
                 path,
                 offset,
@@ -526,21 +608,21 @@ mod tests {
 
     #[test]
     fn test_parse_read_file_mixed_with_operations() {
-        let input = "*** Begin Patch\n*** Read File: src/main.rs\n*** Update File: src/lib.rs\n@@\n ctx\n-old\n+new\n*** Delete File: old.rs\n*** End Patch";
-        let ops = parse_patch(input).unwrap();
-        assert_eq!(ops.len(), 3);
-        assert!(matches!(ops[0], FileOp::Read { .. }));
-        assert!(matches!(ops[1], FileOp::Update { .. }));
-        assert!(matches!(ops[2], FileOp::Delete { .. }));
+        let input = "=== begin\nread src/main.rs\nupdate src/lib.rs\n@@\n ctx\n-old\n+new\ndelete old.rs\n=== end";
+        let result = parse_patch(input).unwrap();
+        assert_eq!(result.ops.len(), 3);
+        assert!(matches!(result.ops[0], FileOp::Read { .. }));
+        assert!(matches!(result.ops[1], FileOp::Update { .. }));
+        assert!(matches!(result.ops[2], FileOp::Delete { .. }));
     }
 
     #[test]
     fn test_parse_auto_wrap_missing_begin() {
-        // Input has *** End Patch but NOT *** Begin Patch — should still work
-        let input = "*** Add File: test.txt\n+hello\n*** End Patch";
-        let ops = parse_patch(input).unwrap();
-        assert_eq!(ops.len(), 1);
-        match &ops[0] {
+        // Input has end but NOT begin — should still work
+        let input = "create test.txt\n+hello\n=== end";
+        let result = parse_patch(input).unwrap();
+        assert_eq!(result.ops.len(), 1);
+        match &result.ops[0] {
             FileOp::Add { path, content } => {
                 assert_eq!(path, "test.txt");
                 assert_eq!(content, "hello\n");
@@ -551,11 +633,11 @@ mod tests {
 
     #[test]
     fn test_parse_auto_wrap_missing_end() {
-        // Input has *** Begin Patch but NOT *** End Patch — should still work
-        let input = "*** Begin Patch\n*** Delete File: old.txt";
-        let ops = parse_patch(input).unwrap();
-        assert_eq!(ops.len(), 1);
-        match &ops[0] {
+        // Input has begin but NOT end — should still work
+        let input = "=== begin\ndelete old.txt";
+        let result = parse_patch(input).unwrap();
+        assert_eq!(result.ops.len(), 1);
+        match &result.ops[0] {
             FileOp::Delete { path } => assert_eq!(path, "old.txt"),
             _ => panic!("Expected Delete"),
         }
@@ -564,15 +646,89 @@ mod tests {
     #[test]
     fn test_parse_auto_wrap_both_missing() {
         // Input has NEITHER marker, just raw ops — should still work
-        let input = "*** Add File: test.txt\n+hello\n";
-        let ops = parse_patch(input).unwrap();
-        assert_eq!(ops.len(), 1);
-        match &ops[0] {
+        let input = "create test.txt\n+hello\n";
+        let result = parse_patch(input).unwrap();
+        assert_eq!(result.ops.len(), 1);
+        match &result.ops[0] {
             FileOp::Add { path, content } => {
                 assert_eq!(path, "test.txt");
                 assert_eq!(content, "hello\n");
             }
             _ => panic!("Expected Add"),
+        }
+    }
+
+    #[test]
+    fn test_parse_threshold_valid() {
+        let input = "=== begin threshold=0.95\ncreate test.txt\n+hello\n=== end";
+        let result = parse_patch(input).unwrap();
+        assert_eq!(result.threshold, Some(0.95));
+    }
+
+    #[test]
+    fn test_parse_threshold_missing() {
+        let input = "=== begin\ncreate test.txt\n+hello\n=== end";
+        let result = parse_patch(input).unwrap();
+        assert!(result.threshold.is_none());
+    }
+
+    #[test]
+    fn test_parse_threshold_invalid_value() {
+        let input = "=== begin threshold=invalid\ncreate test.txt\n+hello\n=== end";
+        let result = parse_patch(input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Invalid threshold"));
+    }
+
+    #[test]
+    fn test_parse_threshold_out_of_range() {
+        let input = "=== begin threshold=1.5\ncreate test.txt\n+hello\n=== end";
+        let result = parse_patch(input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("between 0.0 and 1.0"));
+    }
+
+    #[test]
+    fn test_parse_map_directory() {
+        let input = "=== begin\nmap src/ depth=2\n=== end";
+        let result = parse_patch(input).unwrap();
+        assert_eq!(result.ops.len(), 1);
+        match &result.ops[0] {
+            FileOp::Map {
+                path,
+                depth,
+                output_limit,
+            } => {
+                assert_eq!(path, "src/");
+                assert_eq!(depth, &Some(2));
+                assert!(output_limit.is_none());
+            }
+            _ => panic!("Expected Map"),
+        }
+    }
+
+    #[test]
+    fn test_parse_update_indented_diff() {
+        // Test with 2-space indented diff lines
+        let input = "=== begin\nupdate src/lib.rs\n  @@ fn main\n   fn main() {\n  -    old()\n  +    new()\n   }\n=== end";
+        let result = parse_patch(input).unwrap();
+        match &result.ops[0] {
+            FileOp::Update { hunks, .. } => {
+                assert_eq!(hunks[0].context_hint, Some("fn main".to_string()));
+                // Check that indented lines are parsed correctly
+                assert_eq!(hunks[0].lines.len(), 4);
+                // Line 0: "  fn main() {" -> Context(" fn main() {")
+                assert!(matches!(&hunks[0].lines[0], DiffLine::Context(s) if s == " fn main() {"));
+                // Line 1: "  -    old()" -> Remove("    old()")
+                assert!(matches!(&hunks[0].lines[1], DiffLine::Remove(s) if s == "    old()"));
+                // Line 2: "  +    new()" -> Add("    new()")
+                assert!(matches!(&hunks[0].lines[2], DiffLine::Add(s) if s == "    new()"));
+                // Line 3: "   }" -> Context(" }")
+                assert!(matches!(&hunks[0].lines[3], DiffLine::Context(s) if s == " }"));
+            }
+            _ => panic!("Expected Update"),
         }
     }
 }

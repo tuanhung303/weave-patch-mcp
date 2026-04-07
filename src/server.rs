@@ -15,7 +15,7 @@ use crate::{applier, parser, reader};
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct BatchExecParams {
     #[schemars(
-        description = "V4A patch text containing Read, Add, Update, Delete operations. Wrap in *** Begin Patch / *** End Patch."
+        description = "Compact syntax patch text containing Read, Add, Update, Delete operations. Wrap in === begin / === end."
     )]
     pub patch: String,
 
@@ -40,7 +40,7 @@ impl ApplyPatchServer {
 
     #[tool(
         name = "batch__exec",
-        description = "Unified workspace tool: read, map, add, update, and delete files atomically.\nVersion: 1.0.6\n\nFORMAT: wrap everything in *** Begin Patch / *** End Patch.\n\nEXAMPLES:\n\n1. Read a file:\n  *** Begin Patch\n  *** Read File: src/main.rs\n  *** End Patch\n\n2. Read with symbols:\n  *** Begin Patch\n  *** Read File: src/lib.rs symbols=Server,handle_request language=rust\n  *** End Patch\n\n3. Read with line range:\n  *** Begin Patch\n  *** Read File: config.py offset=10 limit=50\n  *** End Patch\n\n4. Map a directory:\n  *** Begin Patch\n  *** Map Directory: src/ depth=2\n  *** End Patch\n\n5. Add a new file:\n  *** Begin Patch\n  *** Add File: src/hello.rs\n  +pub fn hello() { println!(\\\"Hello!\\\"); }\n  *** End Patch\n\n6. Update a file:\n  *** Begin Patch\n  *** Update File: src/lib.rs\n  @@ fn main\n   fn main() {\n  -    old_code();\n  +    new_code();\n   }\n  *** End Patch\n\n7. Update with multiple hunks:\n  *** Begin Patch\n  *** Update File: src/lib.rs\n  @@ fn setup\n   fn setup() {\n  -    old_init();\n  +    new_init();\n   }\n  @@ fn teardown\n   fn teardown() {\n  -    old_cleanup();\n  +    new_cleanup();\n   }\n  *** End Patch\n\n8. Rename a file:\n  *** Begin Patch\n  *** Update File: src/old.rs\n  *** Move to: src/new.rs\n  @@ fn foo\n   fn foo() { ... }\n  *** End Patch\n\n9. Delete a file:\n  *** Begin Patch\n  *** Delete File: src/old.rs\n  *** End Patch\n\n10. Combined operations:\n  *** Begin Patch\n  *** Read File: src/main.rs\n  *** Update File: src/lib.rs\n  @@ fn main\n   fn main() {\n  -    old();\n  +    new();\n   }\n  *** Add File: src/greet.rs\n  +pub fn greet() { println!(\\\"hi\\\"); }\n  *** Delete File: src/deprecated.rs\n  *** End Patch\n\n11. Read multiple files:\n  *** Begin Patch\n  *** Read File: src/main.rs\n  *** Read File: src/lib.rs\n  *** Read File: src/config.rs\n  *** End Patch\n\n12. Update multiple files:\n  *** Begin Patch\n  *** Update File: src/api.rs\n  @@ fn handle\n   fn handle() {\n  -    old();\n  +    new();\n   }\n  *** Update File: src/db.rs\n  @@ fn connect\n   fn connect() {\n  -    let url = \"old\";\n  +    let url = \"new\";\n   }\n  *** End Patch\n\n13. Delete multiple files:\n  *** Begin Patch\n  *** Delete File: src/deprecated1.rs\n  *** Delete File: src/deprecated2.rs\n  *** Delete File: src/deprecated3.rs\n  *** End Patch\n\nOPTIONS:\n  *** Read File: <path> [symbols=a,b] [language=rust] [offset=N] [limit=N]\n  *** Map Directory: <path> [depth=N] [limit=N]  (default: depth=3, limit=6000)\n  *** Update File: <path>   @@ hint (optional)   context/ -/ + lines\n  *** Add File: <path>      +content lines\n  *** Delete File: <path>   no body needed\n  *** Move to: <path>       (inside Update, renames file)\n\nSECURITY: No path traversal (../), no symlinks, no absolute paths.\n\nVALIDATORS: rustfmt, gofmt, py_compile, json.tool, bash -n, node --check, terraform fmt (advisory)."
+        description = "Unified workspace tool: read, map, add, update, and delete files atomically.\nVersion: 2.0.0\n\nFORMAT: wrap everything in === begin / === end.\n\nEXAMPLES:\n\n1. Read a file:\n  === begin\n  read src/main.rs\n  === end\n\n2. Read with symbols:\n  === begin\n  read src/lib.rs symbols=Server,handle_request language=rust\n  === end\n\n3. Read with line range:\n  === begin\n  read config.py offset=10 limit=50\n  === end\n\n4. Map a directory:\n  === begin\n  map src/ depth=2\n  === end\n\n5. Add a new file:\n  === begin\n  create src/hello.rs\n  +pub fn hello() { println!(\\\"Hello!\\\"); }\n  === end\n\n6. Update a file:\n  === begin\n  update src/lib.rs\n  @@ fn main\n   fn main() {\n  -    old_code();\n  +    new_code();\n   }\n  === end\n\n7. Update with multiple hunks:\n  === begin\n  update src/lib.rs\n  @@ fn setup\n   fn setup() {\n  -    old_init();\n  +    new_init();\n   }\n  @@ fn teardown\n   fn teardown() {\n  -    old_cleanup();\n  +    new_cleanup();\n   }\n  === end\n\n8. Rename a file:\n  === begin\n  update src/old.rs\n  move_to src/new.rs\n  @@ fn foo\n   fn foo() { ... }\n  === end\n\n9. Delete a file:\n  === begin\n  delete src/old.rs\n  === end\n\n10. Combined operations:\n  === begin\n  read src/main.rs\n  update src/lib.rs\n  @@ fn main\n   fn main() {\n  -    old();\n  +    new();\n   }\n  create src/greet.rs\n  +pub fn greet() { println!(\\\"hi\\\"); }\n  delete src/deprecated.rs\n  === end\n\n11. Read multiple files:\n  === begin\n  read src/main.rs\n  read src/lib.rs\n  read src/config.rs\n  === end\n\n12. Update multiple files:\n  === begin\n  update src/api.rs\n  @@ fn handle\n   fn handle() {\n  -    old();\n  +    new();\n   }\n  update src/db.rs\n  @@ fn connect\n   fn connect() {\n  -    let url = \"old\";\n  +    let url = \"new\";\n   }\n  === end\n\n13. Delete multiple files:\n  === begin\n  delete src/deprecated1.rs\n  delete src/deprecated2.rs\n  delete src/deprecated3.rs\n  === end\n\nOPTIONS:\n  read <path> [symbols=a,b] [language=rust] [offset=N] [limit=N]\n  map <path> [depth=N] [limit=N]  (default: depth=3, limit=6000)\n  update <path>   @@ hint (optional)   context/ -/ + lines\n  create <path>   +content lines\n  delete <path>   no body needed\n  move_to <path>  (inside Update, renames file)\n\nSECURITY: No path traversal (../), no symlinks, no absolute paths.\n\nVALIDATORS: rustfmt, gofmt, py_compile, json.tool, bash -n, node --check, terraform fmt (advisory)."
     )]
     async fn exec(
         &self,
@@ -48,7 +48,7 @@ impl ApplyPatchServer {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         if params.patch.is_empty() {
             return Ok(CallToolResult::error(vec![Content::text(
-                "patch is required. Wrap operations in *** Begin Patch / *** End Patch.",
+                "patch is required. Wrap operations in === begin / === end.",
             )]));
         }
 
@@ -63,8 +63,8 @@ impl ApplyPatchServer {
 
         let mut output_parts: Vec<String> = Vec::new();
 
-        let ops = match parser::parse_patch(&params.patch) {
-            Ok(ops) => ops,
+        let parse_result = match parser::parse_patch(&params.patch) {
+            Ok(result) => result,
             Err(e) => {
                 let msg = format!("Parse error: {e}");
                 tracing::error!("{}", msg);
@@ -75,7 +75,8 @@ impl ApplyPatchServer {
         };
 
         // Separate Read operations from write operations
-        let (read_ops, write_ops): (Vec<_>, Vec<_>) = ops
+        let (read_ops, write_ops): (Vec<_>, Vec<_>) = parse_result
+            .ops
             .into_iter()
             .partition(|op| matches!(op, parser::FileOp::Read { .. } | parser::FileOp::Map { .. }));
 
@@ -190,7 +191,11 @@ impl ApplyPatchServer {
         }
 
         // Execute Write operations (add/update/delete)
-        let result = applier::apply_patch_with_threshold(write_ops, &base_dir, params.threshold);
+        let result = applier::apply_patch_with_threshold(
+            write_ops,
+            &base_dir,
+            parse_result.threshold.or(params.threshold),
+        );
 
         let has_error = result.operations.iter().any(|op| op.status == "error");
 
@@ -677,9 +682,9 @@ impl ServerHandler for ApplyPatchServer {
         )
         .with_instructions(
             "Structured file patching MCP server. One tool: batch__exec.\n\n\
-             Unified format: Read, Add, Update, Delete files in *** Begin Patch / *** End Patch.\n\n\
-             Read: *** Read File: <path> [symbols=a,b] [language=rust] [offset=0] [limit=100]\n\n\
-             Write: *** Add/Update/Delete File: <path>\n\n\
+             Unified format: Read, Add, Update, Delete files in === begin / === end.\n\n\
+             Read: read  <path> [symbols=a,b] [language=rust] [offset=0] [limit=100]\n\n\
+             Write: create/update/delete  <path>\n\n\
              Security: no path traversal, no symlinks.\n\n\
              Validators: rustfmt, gofmt, py_compile, json.tool, bash -n, node --check, terraform fmt (advisory)."
         )
