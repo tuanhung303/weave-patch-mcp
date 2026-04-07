@@ -26,12 +26,12 @@ pub struct BatchExecParams {
 }
 
 #[derive(Clone)]
-pub struct ApplyPatchServer {
+pub struct WeavePatchServer {
     tool_router: ToolRouter<Self>,
 }
 
 #[tool_router]
-impl ApplyPatchServer {
+impl WeavePatchServer {
     pub fn new() -> Self {
         Self {
             tool_router: Self::tool_router(),
@@ -213,7 +213,7 @@ impl ApplyPatchServer {
         }
 
         // Execute Write operations (add/update/delete)
-        let result = applier::apply_patch_with_threshold(
+        let result = applier::weave_patch_with_threshold(
             write_ops,
             &base_dir,
             parse_result.threshold.or(params.threshold),
@@ -307,7 +307,8 @@ impl ApplyPatchServer {
             }
         };
 
-        tracing::info!("apply_patch result: {}", patch_output);
+        tracing::info!("weave_patch result: {}", patch_output);
+   tracing::info!("weave_patch result: {}", patch_output);
 
         if has_error {
             output_parts.push(patch_output);
@@ -541,7 +542,7 @@ impl ApplyPatchServer {
     }
 }
 
-impl Default for ApplyPatchServer {
+impl Default for WeavePatchServer {
     fn default() -> Self {
         Self::new()
     }
@@ -703,7 +704,7 @@ fn infer_language(path: &str) -> String {
 }
 
 #[tool_handler]
-impl ServerHandler for ApplyPatchServer {
+impl ServerHandler for WeavePatchServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
             ServerCapabilities::builder()
@@ -722,7 +723,7 @@ impl ServerHandler for ApplyPatchServer {
 }
 
 pub async fn run() -> anyhow::Result<()> {
-    let service = ApplyPatchServer::new().serve(stdio()).await?;
+    let service = WeavePatchServer::new().serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
 }

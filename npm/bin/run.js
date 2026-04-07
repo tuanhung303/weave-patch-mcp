@@ -6,8 +6,8 @@ const fs = require("fs");
 const os = require("os");
 
 const isWindows = process.platform === "win32";
-const cacheBinDir = path.join(os.homedir(), ".mcp-apply-patch", "bin");
-const binName = isWindows ? "apply-patch-mcp.exe" : "apply-patch-mcp";
+const cacheBinDir = path.join(os.homedir(), ".weave-patch", "bin");
+const binName = isWindows ? "weave-patch-mcp.exe" : "weave-patch-mcp";
 const cachedBinPath = path.join(cacheBinDir, binName);
 const expectedVersion = require("../package.json").version;
 const installer = path.join(__dirname, "..", "scripts", "install.js");

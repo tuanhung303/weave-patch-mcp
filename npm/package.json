@@ -1,14 +1,14 @@
 {
-  "name": "mcp-apply-patch",
+  "name": "mcp-weave-patch",
   "version": "2.0.2",
   "description": "MCP server for structured file patching using compact syntax. Create, update, and delete files in one atomic operation.",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/tuanhung303/apply-patch-mcp"
+    "url": "https://github.com/tuanhung303/weave-patch-mcp"
   },
   "bin": {
-    "mcp-apply-patch": "bin/run.js"
+    "mcp-weave-patch": "bin/run.js"
   },
   "files": [
     "bin/",

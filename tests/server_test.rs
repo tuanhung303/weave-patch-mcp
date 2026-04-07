@@ -3,9 +3,9 @@
 //! Note: These tests focus on the underlying reader and applier modules
 //! since the server methods are private tool handlers.
 
-use apply_patch_mcp::applier::{apply_patch, validate_path};
-use apply_patch_mcp::parser::parse_patch;
-use apply_patch_mcp::reader::{apply_line_range, expand_globs, extract_symbols};
+use weave_patch_mcp::applier::{weave_patch, validate_path};
+use weave_patch_mcp::parser::parse_patch;
+use weave_patch_mcp::reader::{apply_line_range, expand_globs, extract_symbols};
 use std::fs;
 use tempfile::TempDir;
 
@@ -235,7 +235,7 @@ fn read_files_total_size_limit_simulated() {
 // =============================================================================
 
 #[test]
-fn batch_apply_patch_success() {
+fn batch_weave_patch_success() {
     let dir = tmp();
     fs::write(dir.path().join("test.txt"), "old content").unwrap();
 
@@ -246,7 +246,7 @@ update test.txt
 === end"#;
 
     let ops = parse_patch(patch).unwrap().ops;
-    let result = apply_patch(ops, dir.path());
+    let result = weave_patch(ops, dir.path());
 
     assert_eq!(
         result.operations[0].status, "ok",
@@ -277,7 +277,7 @@ update test.txt
 === end"#;
 
     let ops = parse_patch(patch).unwrap().ops;
-    let result = apply_patch(ops, dir.path());
+    let result = weave_patch(ops, dir.path());
 
     assert_eq!(
         result.operations[0].status, "error",
@@ -315,7 +315,7 @@ update file2.txt
 === end"#;
 
     let ops = parse_patch(patch).unwrap().ops;
-    let result = apply_patch(ops, dir.path());
+    let result = weave_patch(ops, dir.path());
 
     // Both should fail due to atomic behavior
     let has_error = result.operations.iter().any(|op| op.status == "error");
@@ -337,10 +337,10 @@ update file2.txt
 fn server_capabilities_available() {
     // Test that the server type exists and can be instantiated
     // The actual get_info() returns ServerInfo which we can verify
-    use apply_patch_mcp::server::ApplyPatchServer;
+    use weave_patch_mcp::server::WeavePatchServer;
     use rmcp::ServerHandler;
 
-    let server = ApplyPatchServer::new();
+    let server = WeavePatchServer::new();
     let info = server.get_info();
 
     // ServerInfo has capabilities
@@ -361,7 +361,7 @@ line2
 === end"#;
 
     let ops = parse_patch(patch).unwrap().ops;
-    let result = apply_patch(ops, dir.path());
+    let result = weave_patch(ops, dir.path());
 
     assert_eq!(
         result.operations[0].status, "ok",
@@ -389,7 +389,7 @@ delete todelete.txt
 === end"#;
 
     let ops = parse_patch(patch).unwrap().ops;
-    let result = apply_patch(ops, dir.path());
+    let result = weave_patch(ops, dir.path());
 
     assert_eq!(
         result.operations[0].status, "ok",
@@ -416,7 +416,7 @@ move_to new.txt
 === end"#;
 
     let ops = parse_patch(patch).unwrap().ops;
-    let _result = apply_patch(ops, dir.path());
+    let _result = weave_patch(ops, dir.path());
 
     // Move may be supported; check file state
     let old_exists = dir.path().join("old.txt").exists();

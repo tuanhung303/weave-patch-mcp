@@ -197,8 +197,8 @@ fn detect_file_conflicts(ops: &[FileOp]) -> Result<(), (String, String)> {
 }
 
 #[must_use]
-pub fn apply_patch(ops: Vec<FileOp>, base_dir: &Path) -> PatchResult {
-    apply_patch_with_threshold(ops, base_dir, None)
+pub fn weave_patch(ops: Vec<FileOp>, base_dir: &Path) -> PatchResult {
+    weave_patch_with_threshold(ops, base_dir, None)
 }
 
 /// Apply patch operations with an optional fuzzy matching threshold.
@@ -208,7 +208,7 @@ pub fn apply_patch(ops: Vec<FileOp>, base_dir: &Path) -> PatchResult {
 /// * `base_dir` - Base directory for resolving relative paths
 /// * `threshold` - Optional fuzzy matching threshold (0.0-1.0). Defaults to FUZZY_THRESHOLD (0.97) if None.
 #[must_use]
-pub fn apply_patch_with_threshold(
+pub fn weave_patch_with_threshold(
     ops: Vec<FileOp>,
     base_dir: &Path,
     threshold: Option<f32>,
@@ -1171,7 +1171,7 @@ mod tests {
             path: "hello.txt".to_string(),
             content: "hello\nworld\n".to_string(),
         }];
-        let result = apply_patch(ops, dir.path());
+        let result = weave_patch(ops, dir.path());
         assert_eq!(result.operations[0].status, "ok");
         assert_eq!(
             fs::read_to_string(dir.path().join("hello.txt")).unwrap(),
@@ -1186,7 +1186,7 @@ mod tests {
             path: "hello.txt".to_string(),
             content: "hello\nworld\n".to_string(),
         }];
-        let result = apply_patch(ops, dir.path());
+        let result = weave_patch(ops, dir.path());
         assert!(result.operations[0].diff.is_some());
         let diff = result.operations[0].diff.as_ref().unwrap();
         assert!(diff.contains("--- /dev/null"));
@@ -1202,7 +1202,7 @@ mod tests {
             path: "a/b/c.txt".to_string(),
             content: "nested\n".to_string(),
         }];
-        let result = apply_patch(ops, dir.path());
+        let result = weave_patch(ops, dir.path());
         assert_eq!(result.operations[0].status, "ok");
         assert!(dir.path().join("a/b/c.txt").exists());
     }
@@ -1216,7 +1216,7 @@ mod tests {
         let ops = vec![FileOp::Delete {
             path: "target.txt".to_string(),
         }];
-        let result = apply_patch(ops, dir.path());
+        let result = weave_patch(ops, dir.path());
         assert_eq!(result.operations[0].status, "ok");
         assert!(!file_path.exists());
     }
@@ -1231,7 +1231,7 @@ mod tests {
         let ops = vec![FileOp::Delete {
             path: "target.txt".to_string(),
         }];
-        let result = apply_patch(ops, dir.path());
+        let result = weave_patch(ops, dir.path());
         assert_eq!(result.operations[0].status, "ok");
         assert_eq!(result.operations[0].line_changes, Some((4, 0)));
         assert!(result.operations[0].message.contains("removed 4 lines"));
@@ -1256,7 +1256,7 @@ mod tests {
             }],
             move_to: None,
         }];
-        let result = apply_patch(ops, dir.path());
+        let result = weave_patch(ops, dir.path());
         assert_eq!(
             result.operations[0].status, "ok",
             "{}",
@@ -1285,7 +1285,7 @@ mod tests {
             }],
             move_to: None,
         }];
-        let result = apply_patch(ops, dir.path());
+        let result = weave_patch(ops, dir.path());
         assert_eq!(result.operations[0].status, "ok");
 
         // Should have diff
@@ -1339,7 +1339,7 @@ mod tests {
             ],
             move_to: None,
         }];
-        let result = apply_patch(ops, dir.path());
+        let result = weave_patch(ops, dir.path());
         assert_eq!(
             result.operations[0].status, "ok",
             "{}",
@@ -1365,7 +1365,7 @@ mod tests {
             hunks: vec![],
             move_to: None,
         }];
-        let result = apply_patch(ops, dir.path());
+        let result = weave_patch(ops, dir.path());
         assert_eq!(result.operations[0].status, "error");
         assert!(
             result.operations[0].message.contains("not found")
@@ -1391,7 +1391,7 @@ mod tests {
             }],
             move_to: None,
         }];
-        let result = apply_patch(ops, dir.path());
+        let result = weave_patch(ops, dir.path());
         assert_eq!(result.operations[0].status, "error");
         assert!(
             result.operations[0].message.contains("Context not found")
@@ -1414,7 +1414,7 @@ mod tests {
                 path: "existing.txt".to_string(),
             },
         ];
-        let result = apply_patch(ops, dir.path());
+        let result = weave_patch(ops, dir.path());
         assert_eq!(result.operations[0].status, "ok");
         assert_eq!(result.operations[1].status, "ok");
         assert!(dir.path().join("new.txt").exists());
@@ -1430,7 +1430,7 @@ mod tests {
             path: "../outside_file.txt".to_string(),
             content: "content\n".to_string(),
         }];
-        let result = apply_patch(ops, dir.path());
+        let result = weave_patch(ops, dir.path());
         // Path is now allowed (will fail only if parent doesn't exist or permission denied)
         // For this test, we create a sibling directory
         let parent = dir.path().parent().unwrap();
@@ -1460,7 +1460,7 @@ mod tests {
         let ops = vec![FileOp::Delete {
             path: "../sibling_to_delete.txt".to_string(),
         }];
-        let result = apply_patch(ops, dir.path());
+        let result = weave_patch(ops, dir.path());
         // Should succeed in deleting the sibling file
         assert_eq!(
             result.operations[0].status, "ok",
@@ -1479,7 +1479,7 @@ mod tests {
             path: unique_name.clone(),
             content: "test content\n".to_string(),
         }];
-        let result = apply_patch(ops, dir.path());
+        let result = weave_patch(ops, dir.path());
         // Should succeed (or fail with permission error, not traversal)
         if result.operations[0].status == "ok" {
             // Cleanup
@@ -1506,7 +1506,7 @@ mod tests {
         let ops = vec![FileOp::Delete {
             path: "link.txt".to_string(),
         }];
-        let result = apply_patch(ops, dir.path());
+        let result = weave_patch(ops, dir.path());
         assert_eq!(result.operations[0].status, "error");
         assert!(
             result.operations[0].message.contains("ymlink"),
@@ -1537,7 +1537,7 @@ mod tests {
             }],
             move_to: None,
         }];
-        let result = apply_patch(ops, dir.path());
+        let result = weave_patch(ops, dir.path());
         assert_eq!(result.operations[0].status, "error");
         assert!(
             result.operations[0].message.contains("ymlink"),
@@ -1557,7 +1557,7 @@ mod tests {
             path: "sub/../escape.txt".to_string(),
             content: "content\n".to_string(),
         }];
-        let result = apply_patch(ops, dir.path());
+        let result = weave_patch(ops, dir.path());
         // Should succeed - file created inside the temp dir
         assert_eq!(
             result.operations[0].status, "ok",
@@ -1577,7 +1577,7 @@ mod tests {
             path: "sub\\file.txt".to_string(), // Creates file named "sub\file.txt"
             content: "content\n".to_string(),
         }];
-        let result = apply_patch(ops, dir.path());
+        let result = weave_patch(ops, dir.path());
         // Should succeed (creates file with backslash in name on Unix)
         if result.operations[0].status == "ok" {
             // Cleanup
@@ -1614,7 +1614,7 @@ mod tests {
         }];
         // Use 0.85 threshold to match original fuzzy behavior
         // With 0.97 default, this would fail due to low similarity
-        let result = apply_patch_with_threshold(ops, dir.path(), Some(0.85));
+        let result = weave_patch_with_threshold(ops, dir.path(), Some(0.85));
         assert_eq!(
             result.operations[0].status, "ok",
             "Phase 2/3 match should succeed with 0.85 threshold: {}",
@@ -1664,7 +1664,7 @@ mod tests {
         }];
         // Use 0.85 threshold for fuzzy match with slight differences
         // With 0.97 default, this would fail (similarity ~95%)
-        let result = apply_patch_with_threshold(ops, dir.path(), Some(0.85));
+        let result = weave_patch_with_threshold(ops, dir.path(), Some(0.85));
         assert_eq!(
             result.operations[0].status, "ok",
             "Phase 3 fuzzy match should succeed with 0.85 threshold: {}",
@@ -1698,7 +1698,7 @@ mod tests {
             }],
             move_to: None,
         }];
-        let result = apply_patch(ops, dir.path());
+        let result = weave_patch(ops, dir.path());
         // Should fail — fuzzy must not run for 2-line patterns (context only = 1 line before Remove)
         assert_eq!(
             result.operations[0].status, "error",
@@ -1729,7 +1729,7 @@ mod tests {
             }],
             move_to: None,
         }];
-        let result = apply_patch(ops, dir.path());
+        let result = weave_patch(ops, dir.path());
         // Should fail — fuzzy skipped for large files
         assert_eq!(
             result.operations[0].status, "error",
@@ -1766,7 +1766,7 @@ mod tests {
                 move_to: None,
             },
         ];
-        let result = apply_patch(ops, dir.path());
+        let result = weave_patch(ops, dir.path());
         // Op1 staged ok, op2 failed
         assert_eq!(result.operations[0].status, "ok");
         assert_eq!(result.operations[1].status, "error");
@@ -1810,7 +1810,7 @@ mod tests {
                 move_to: None,
             },
         ];
-        let _ = apply_patch(ops, dir.path());
+        let _ = weave_patch(ops, dir.path());
 
         // No .patch_tmp files in the tmp dir
         let remaining: Vec<_> = fs::read_dir(dir.path())
@@ -1870,7 +1870,7 @@ mod tests {
                 move_to: None,
             },
         ];
-        let result = apply_patch(ops, dir.path());
+        let result = weave_patch(ops, dir.path());
         assert!(result.operations.iter().all(|o| o.status == "ok"));
         assert_eq!(
             fs::read_to_string(dir.path().join("f1.txt")).unwrap(),
@@ -1906,7 +1906,7 @@ mod tests {
             }],
             move_to: None,
         }];
-        let result = apply_patch(ops, dir.path());
+        let result = weave_patch(ops, dir.path());
         assert_eq!(result.operations[0].status, "error");
         // The error message should contain "Context not found"
         assert!(
@@ -2070,7 +2070,7 @@ echo hello
             offset: None,
             limit: None,
         }];
-        let result = apply_patch(ops, dir.path());
+        let result = weave_patch(ops, dir.path());
         assert_eq!(result.operations.len(), 1);
         assert_eq!(result.operations[0].status, "ok");
         assert_eq!(result.operations[0].op_type, "read");
@@ -2086,7 +2086,7 @@ echo hello
             offset: None,
             limit: None,
         }];
-        let result = apply_patch(ops, dir.path());
+        let result = weave_patch(ops, dir.path());
         assert_eq!(result.operations.len(), 1);
         assert_eq!(result.operations[0].status, "error");
         assert_eq!(result.operations[0].op_type, "read");
@@ -2107,7 +2107,7 @@ echo hello
             offset: None,
             limit: None,
         }];
-        let result = apply_patch(ops, dir.path());
+        let result = weave_patch(ops, dir.path());
         assert_eq!(result.operations.len(), 1);
         assert_eq!(result.operations[0].status, "error");
         assert!(result.operations[0].message.contains("Symlink"));
@@ -2129,7 +2129,7 @@ echo hello
             offset: None,
             limit: None,
         }];
-        let result = apply_patch(ops, dir.path());
+        let result = weave_patch(ops, dir.path());
         // Should succeed in reading the sibling file
         assert_eq!(result.operations.len(), 1);
         assert_eq!(

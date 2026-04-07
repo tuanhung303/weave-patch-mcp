@@ -27,30 +27,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
-name = "apply-patch-mcp"
-version = "2.0.1"
-dependencies = [
- "anyhow",
- "dirs",
- "glob",
- "parking_lot",
- "rayon",
- "regex",
- "rmcp",
- "schemars",
- "serde",
- "serde_json",
- "similar",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
 name = "async-trait"
 version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1301,6 +1277,30 @@ dependencies = [
  "hashbrown 0.15.5",
  "indexmap",
  "semver",
+]
+
+[[package]]
+name = "weave-patch-mcp"
+version = "2.0.2"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "glob",
+ "parking_lot",
+ "rayon",
+ "regex",
+ "rmcp",
+ "schemars",
+ "serde",
+ "serde_json",
+ "similar",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

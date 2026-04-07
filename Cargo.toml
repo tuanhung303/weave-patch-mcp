@@ -1,5 +1,5 @@
 [package]
-name = "apply-patch-mcp"
+name = "weave-patch-mcp"
 version = "2.0.2"
 edition = "2024"
 
@@ -26,9 +26,9 @@ parking_lot = "0.12"
 tempfile = "3"
 
 [lib]
-name = "apply_patch_mcp"
+name = "weave_patch_mcp"
 path = "src/lib.rs"
 
 [[bin]]
-name = "apply-patch-mcp"
+name = "weave-patch-mcp"
 path = "src/main.rs"

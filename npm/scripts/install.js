@@ -6,7 +6,7 @@ const os = require("os");
 const crypto = require("crypto");
 
 const VERSION = require("../package.json").version;
-const REPO = "tuanhung303/apply-patch-mcp";
+const REPO = "tuanhung303/weave-patch-mcp";
 
 function getPlatformKey() {
   const platform = process.platform;
@@ -43,7 +43,7 @@ function download(url) {
       res.on("end", () => resolve(Buffer.concat(chunks)));
       res.on("error", reject);
     };
-    https.get(url, { headers: { "User-Agent": "apply-patch-mcp-installer" } }, handler).on("error", reject);
+    https.get(url, { headers: { "User-Agent": "weave-patch-mcp-installer" } }, handler).on("error", reject);
   });
 }
 
@@ -62,13 +62,13 @@ async function doInstall() {
   const platformKey = getPlatformKey();
   const isWindows = process.platform === "win32";
   const ext = isWindows ? ".zip" : ".tar.gz";
-  const assetName = `apply-patch-mcp-v${VERSION}-${platformKey}${ext}`;
+  const assetName = `weave-patch-mcp-v${VERSION}-${platformKey}${ext}`;
   const shaAssetName = `${assetName}.sha256`;
   const assetUrl = `https://github.com/${REPO}/releases/download/v${VERSION}/${assetName}`;
   const shaUrl = `https://github.com/${REPO}/releases/download/v${VERSION}/${shaAssetName}`;
 
-  const cacheBinDir = path.join(os.homedir(), ".mcp-apply-patch", "bin");
-  const binName = isWindows ? "apply-patch-mcp.exe" : "apply-patch-mcp";
+  const cacheBinDir = path.join(os.homedir(), ".weave-patch", "bin");
+  const binName = isWindows ? "weave-patch-mcp.exe" : "weave-patch-mcp";
   const binPath = path.join(cacheBinDir, binName);
 
   // Check if correct version is already installed
@@ -80,7 +80,7 @@ async function doInstall() {
       });
       const installed = out.toString().trim();
       if (installed === VERSION) {
-        console.error(`apply-patch-mcp v${VERSION} already installed.`);
+        console.error(`weave-patch-mcp v${VERSION} already installed.`);
         return binPath;
       }
       console.error(`Cached binary is v${installed}, need v${VERSION}. Reinstalling...`);
@@ -92,7 +92,7 @@ async function doInstall() {
     }
   }
 
-  console.error(`Downloading apply-patch-mcp v${VERSION} for ${platformKey}...`);
+  console.error(`Downloading weave-patch-mcp v${VERSION} for ${platformKey}...`);
 
   try {
     // Download the binary and its SHA256 checksum in parallel
@@ -131,7 +131,7 @@ async function doInstall() {
     try { fs.unlinkSync(tmpFile); } catch (e) { /* ignore */ }
     try { fs.unlinkSync(tmpShaFile); } catch (e) { /* ignore */ }
 
-    console.error(`apply-patch-mcp v${VERSION} installed to ${binPath}.`);
+    console.error(`weave-patch-mcp v${VERSION} installed to ${binPath}.`);
     return binPath;
   } catch (err) {
     if (err.message.includes("SHA256 mismatch")) {

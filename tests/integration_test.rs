@@ -1,5 +1,5 @@
-use apply_patch_mcp::applier::{apply_patch, apply_patch_with_threshold};
-use apply_patch_mcp::parser::parse_patch;
+use weave_patch_mcp::applier::{weave_patch, weave_patch_with_threshold};
+use weave_patch_mcp::parser::parse_patch;
 use std::fs;
 use tempfile::TempDir;
 
@@ -30,7 +30,7 @@ fn test_hint_disambiguates_identical_code() {
     );
 
     let ops = parse_patch(input).unwrap().ops;
-    let result = apply_patch(ops, dir.path());
+    let result = weave_patch(ops, dir.path());
     assert_eq!(
         result.operations[0].status, "ok",
         "Hint should disambiguate to function_b: {}",
@@ -79,7 +79,7 @@ fn test_py_nested_indentation_patch() {
     );
 
     let ops = parse_patch(input).unwrap().ops;
-    let result = apply_patch(ops, dir.path());
+    let result = weave_patch(ops, dir.path());
     assert_eq!(
         result.operations[0].status, "ok",
         "Nested indent patch should succeed: {}",
@@ -131,7 +131,7 @@ fn test_crlf_line_endings_patch() {
     );
 
     let ops = parse_patch(input).unwrap().ops;
-    let result = apply_patch(ops, dir.path());
+    let result = weave_patch(ops, dir.path());
     assert_eq!(
         result.operations[0].status, "ok",
         "CRLF patch should succeed after normalization: {}",
@@ -171,7 +171,7 @@ fn test_context_not_found_has_diagnostics() {
     );
 
     let ops = parse_patch(input).unwrap().ops;
-    let result = apply_patch(ops, dir.path());
+    let result = weave_patch(ops, dir.path());
     assert_eq!(
         result.operations[0].status, "error",
         "Non-existent context should fail, got: {}",
@@ -216,7 +216,7 @@ fn patch_empty_file_creation() {
     let input = concat!("=== begin\n", "create empty.txt\n", "=== end",);
 
     let ops = parse_patch(input).unwrap().ops;
-    let result = apply_patch(ops, dir.path());
+    let result = weave_patch(ops, dir.path());
 
     assert_eq!(
         result.operations[0].status, "ok",
@@ -252,7 +252,7 @@ fn patch_unicode_content_preserved() {
     );
 
     let ops = parse_patch(input).unwrap().ops;
-    let result = apply_patch(ops, dir.path());
+    let result = weave_patch(ops, dir.path());
 
     assert_eq!(
         result.operations[0].status, "ok",
@@ -294,7 +294,7 @@ fn patch_very_long_lines_handled() {
     );
 
     let ops = parse_patch(&patch).unwrap().ops;
-    let result = apply_patch(ops, dir.path());
+    let result = weave_patch(ops, dir.path());
 
     assert_eq!(
         result.operations[0].status, "ok",
@@ -335,14 +335,14 @@ fn sequential_patch_same_file() {
 
     // Apply both patches sequentially (simulating concurrent access pattern)
     let ops1 = parse_patch(patch1).unwrap().ops;
-    let _result1 = apply_patch(ops1, dir.path());
+    let _result1 = weave_patch(ops1, dir.path());
 
     // After first patch, the content should be different
     let _content1 = fs::read_to_string(dir.path().join("concurrent.txt")).unwrap();
 
     // Second patch should fail because context "original" no longer exists
     let ops2 = parse_patch(patch2).unwrap().ops;
-    let _result2 = apply_patch(ops2, dir.path());
+    let _result2 = weave_patch(ops2, dir.path());
 
     // One should succeed, one might fail depending on timing
     // The key is that the file should never be corrupted
@@ -389,7 +389,7 @@ fn patch_read_only_file_handling() {
     );
 
     let ops = parse_patch(input).unwrap().ops;
-    let result = apply_patch(ops, dir.path());
+    let result = weave_patch(ops, dir.path());
 
     // The behavior depends on the OS and user permissions:
     // - On Linux as non-root: should fail with error
@@ -449,7 +449,7 @@ fn patch_multi_file_atomic_all_or_nothing() {
     );
 
     let ops = parse_patch(input).unwrap().ops;
-    let result = apply_patch(ops, dir.path());
+    let result = weave_patch(ops, dir.path());
 
     // Entire patch should fail due to context mismatch on file2
     assert!(
@@ -502,7 +502,7 @@ fn test_unified_read_write_patch() {
 
     // Verify first op is Read
     match &ops[0] {
-        apply_patch_mcp::parser::FileOp::Read { path, .. } => {
+        weave_patch_mcp::parser::FileOp::Read { path, .. } => {
             assert_eq!(path, "main.rs");
         }
         _ => panic!("First operation should be Read"),
@@ -510,14 +510,14 @@ fn test_unified_read_write_patch() {
 
     // Verify second op is Update
     match &ops[1] {
-        apply_patch_mcp::parser::FileOp::Update { path, .. } => {
+        weave_patch_mcp::parser::FileOp::Update { path, .. } => {
             assert_eq!(path, "lib.rs");
         }
         _ => panic!("Second operation should be Update"),
     }
 
     // Apply the patch
-    let result = apply_patch(ops, dir.path());
+    let result = weave_patch(ops, dir.path());
     assert_eq!(result.operations.len(), 2);
     assert_eq!(result.operations[0].status, "ok");
     assert_eq!(result.operations[0].op_type, "read");
@@ -559,7 +559,7 @@ fn test_mixed_operations_in_patch() {
     let ops = parse_patch(input).unwrap().ops;
     assert_eq!(ops.len(), 4);
 
-    let result = apply_patch(ops, dir.path());
+    let result = weave_patch(ops, dir.path());
 
     // All operations should succeed
     for op in &result.operations {
@@ -606,7 +606,7 @@ fn test_word_boundary_hint_matching() {
     );
 
     let ops = parse_patch(input).unwrap().ops;
-    let result = apply_patch(ops, dir.path());
+    let result = weave_patch(ops, dir.path());
     assert_eq!(
         result.operations[0].status, "ok",
         "Word-boundary hint should match exactly 'def foo()': {}",
@@ -650,7 +650,7 @@ fn test_word_boundary_hint_matching() {
     );
 
     let ops2 = parse_patch(input2).unwrap().ops;
-    let result2 = apply_patch(ops2, dir.path());
+    let result2 = weave_patch(ops2, dir.path());
     assert_eq!(
         result2.operations[0].status, "ok",
         "Word-boundary hint should match 'def foo_bar()': {}",
@@ -696,7 +696,7 @@ fn test_parallel_patch_multiple_files() {
     let ops = parse_patch(&input).unwrap().ops;
     assert_eq!(ops.len(), 10, "Should have 10 update operations");
 
-    let result = apply_patch(ops, dir.path());
+    let result = weave_patch(ops, dir.path());
 
     // All operations should succeed
     for (i, op) in result.operations.iter().enumerate() {
@@ -736,7 +736,7 @@ fn test_conflict_add_update_same_path() {
     );
 
     let ops = parse_patch(input).unwrap().ops;
-    let result = apply_patch(ops, dir.path());
+    let result = weave_patch(ops, dir.path());
 
     // Should have an error due to conflict
     let has_error = result.operations.iter().any(|op| op.status == "error");
@@ -775,7 +775,7 @@ fn test_threshold_default_rejects_low_similarity() {
     );
 
     let ops = parse_patch(input).unwrap().ops;
-    let result = apply_patch(ops, dir.path());
+    let result = weave_patch(ops, dir.path());
 
     // Should fail because similarity is below 97%
     assert!(
@@ -813,7 +813,7 @@ fn test_threshold_low_accepts_medium_similarity() {
     );
 
     let ops = parse_patch(input).unwrap().ops;
-    let result = apply_patch_with_threshold(ops, dir.path(), Some(0.80));
+    let result = weave_patch_with_threshold(ops, dir.path(), Some(0.80));
 
     // With threshold 0.80, fuzzy matching should accept ~93% similarity
     assert!(
@@ -847,7 +847,7 @@ fn test_threshold_1_0_requires_exact() {
     );
 
     let ops = parse_patch(input).unwrap().ops;
-    let result = apply_patch_with_threshold(ops, dir.path(), Some(1.0));
+    let result = weave_patch_with_threshold(ops, dir.path(), Some(1.0));
 
     // With threshold 1.0, fuzzy match requires 100% similarity
     // One char difference makes similarity < 100%, so fuzzy match fails
@@ -860,7 +860,7 @@ fn test_threshold_1_0_requires_exact() {
 /// Test: Default threshold matches FUZZY_THRESHOLD constant
 #[test]
 fn test_threshold_default_matches_constant() {
-    use apply_patch_mcp::applier::FUZZY_THRESHOLD;
+    use weave_patch_mcp::applier::FUZZY_THRESHOLD;
 
     // Verify the constant is 0.97
     assert!(
@@ -895,7 +895,7 @@ fn test_llm_error_context_not_found() {
     );
 
     let ops = parse_patch(input).unwrap().ops;
-    let result = apply_patch(ops, dir.path());
+    let result = weave_patch(ops, dir.path());
 
     // Should error
     assert!(result.operations[0].status == "error");
@@ -908,7 +908,7 @@ fn test_llm_error_context_not_found() {
 /// Test: FileNotFound produces LLM-readable output
 #[test]
 fn test_llm_error_file_not_found() {
-    use apply_patch_mcp::error::PatchError;
+    use weave_patch_mcp::error::PatchError;
 
     let err = PatchError::FileNotFound("missing.txt".to_string());
     let output = err.to_json();
@@ -921,7 +921,7 @@ fn test_llm_error_file_not_found() {
 /// Test: AmbiguousContext produces LLM-readable output
 #[test]
 fn test_llm_error_ambiguous_context() {
-    use apply_patch_mcp::error::PatchError;
+    use weave_patch_mcp::error::PatchError;
 
     let err = PatchError::AmbiguousContext {
         path: "test.rs".to_string(),
@@ -939,7 +939,7 @@ fn test_llm_error_ambiguous_context() {
 /// Test: Parse error produces LLM-readable output
 #[test]
 fn test_llm_error_parse() {
-    use apply_patch_mcp::error::PatchError;
+    use weave_patch_mcp::error::PatchError;
 
     let err = PatchError::Parse("Invalid patch format".to_string());
     let output = err.to_json();
@@ -951,7 +951,7 @@ fn test_llm_error_parse() {
 /// Test: Path traversal error produces LLM-readable output
 #[test]
 fn test_llm_error_path_traversal() {
-    use apply_patch_mcp::error::PatchError;
+    use weave_patch_mcp::error::PatchError;
 
     let err = PatchError::PathTraversal("../etc/passwd".to_string());
     let output = err.to_json();
@@ -963,7 +963,7 @@ fn test_llm_error_path_traversal() {
 /// Test: Symlink rejected error produces LLM-readable output
 #[test]
 fn test_llm_error_symlink_rejected() {
-    use apply_patch_mcp::error::PatchError;
+    use weave_patch_mcp::error::PatchError;
 
     let err = PatchError::SymlinkRejected("link.txt".to_string());
     let output = err.to_json();
@@ -975,7 +975,7 @@ fn test_llm_error_symlink_rejected() {
 /// Test: FileAlreadyExists error produces LLM-readable output
 #[test]
 fn test_llm_error_file_already_exists() {
-    use apply_patch_mcp::error::PatchError;
+    use weave_patch_mcp::error::PatchError;
 
     let err = PatchError::FileAlreadyExists("existing.txt".to_string());
     let output = err.to_json();
@@ -1008,7 +1008,7 @@ fn test_threshold_0_0_accepts_any_similarity() {
     let ops = parse_patch(input).unwrap().ops;
 
     // With threshold 0.0 (clamped), fuzzy matching accepts any similarity > 0
-    let result = apply_patch_with_threshold(ops, dir.path(), Some(0.0));
+    let result = weave_patch_with_threshold(ops, dir.path(), Some(0.0));
     assert!(
         result.operations[0].status == "ok",
         "Expected patch to succeed with threshold 0.0 (accepts any match)"
@@ -1039,7 +1039,7 @@ fn test_negative_threshold_clamped_to_0() {
     let ops = parse_patch(input).unwrap().ops;
 
     // Negative threshold should be clamped to 0.0 and behave the same as 0.0
-    let result = apply_patch_with_threshold(ops, dir.path(), Some(-0.5));
+    let result = weave_patch_with_threshold(ops, dir.path(), Some(-0.5));
     assert!(
         result.operations[0].status == "ok",
         "Expected patch to succeed with negative threshold (clamped to 0.0)"
@@ -1071,7 +1071,7 @@ fn test_threshold_above_1_clamped_to_1() {
 
     // Threshold 2.0 is clamped to 1.0, requiring 100% similarity
     // One char difference makes similarity < 100%, so fuzzy match fails
-    let result = apply_patch_with_threshold(ops, dir.path(), Some(2.0));
+    let result = weave_patch_with_threshold(ops, dir.path(), Some(2.0));
     assert!(
         result.operations[0].status == "error",
         "Expected patch to fail with threshold 2.0 (clamped to 1.0, requires 100% similarity)"

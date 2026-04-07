@@ -1,11 +1,11 @@
-# apply-patch-mcp
+# weave-patch-mcp
 
 **v2.0** — Production-ready MCP server for structured file patching using compact syntax.  
 One tool, five operations. Create, read, map, update, and delete files in a single atomic call.
 
 ## Why This Over Edit/Write?
 
-| | Traditional (Edit + Write) | apply-patch-mcp |
+| | Traditional (Edit + Write) | weave-patch-mcp |
 |---|---|---|
 | **Calls per change** | 1 tool call per file | 1 call for all files |
 | **Multi-file atomicity** | No — broken intermediate states | Yes — all-or-nothing |
@@ -17,7 +17,7 @@ One tool, five operations. Create, read, map, update, and delete files in a sing
 
 ### Recommended: Disable Traditional Tools
 
-For best results, deny Edit/Write in your MCP client settings so the model always uses apply-patch:
+For best results, deny Edit/Write in your MCP client settings so the model always uses weave-patch:
 
 Add to your client's deny list:
 ```json
@@ -29,10 +29,10 @@ This eliminates context pollution from unused tool descriptions and forces consi
 ## Installation
 
 ```bash
-npx -y mcp-apply-patch
+npx -y mcp-weave-patch
 ```
 
-No install needed — npx downloads the latest release automatically. The binary is cached at `~/.mcp-apply-patch/bin/` and version-checked on every launch (auto-reinstalls if stale).
+No install needed — npx downloads the latest release automatically. The binary is cached at `~/.weave-patch/bin/` and version-checked on every launch (auto-reinstalls if stale).
 
 ### Supported Platforms
 
@@ -47,16 +47,16 @@ No install needed — npx downloads the latest release automatically. The binary
 ### Claude Code
 
 ```bash
-claude mcp add -s user patch -- npx -y mcp-apply-patch
+claude mcp add -s user weave -- npx -y mcp-weave-patch
 ```
 
 ### Qwen Code
 
 Add to `~/.qwen/settings.json` under `mcpServers`:
 ```json
-"patch": {
+"weave": {
   "command": "npx",
-  "args": ["-y", "mcp-apply-patch"]
+  "args": ["-y", "mcp-weave-patch"]
 }
 ```
 
@@ -66,9 +66,9 @@ Add to `~/.gemini/settings.json`:
 ```json
 {
   "mcpServers": {
-    "patch": {
+    "weave": {
       "command": "npx",
-      "args": ["-y", "mcp-apply-patch"]
+      "args": ["-y", "mcp-weave-patch"]
     }
   }
 }
@@ -80,9 +80,9 @@ Add to your config:
 ```json
 {
   "mcpServers": {
-    "patch": {
+    "weave": {
       "command": "npx",
-      "args": ["-y", "mcp-apply-patch"]
+      "args": ["-y", "mcp-weave-patch"]
     }
   }
 }
@@ -303,7 +303,7 @@ Build from source:
 cargo build --release
 ```
 
-Binary: `target/release/apply-patch-mcp`
+Binary: `target/release/weave-patch-mcp`
 
 Run tests:
 

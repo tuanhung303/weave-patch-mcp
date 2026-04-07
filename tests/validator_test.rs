@@ -1,6 +1,6 @@
 //! Tests for src/validator.rs - External tool validation
 
-use apply_patch_mcp::validator::validate_file;
+use weave_patch_mcp::validator::validate_file;
 use std::fs;
 use tempfile::TempDir;
 

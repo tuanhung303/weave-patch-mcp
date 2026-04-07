@@ -2,6 +2,6 @@
 
 # npm wrapper
 npm/node_modules/
-npm/bin/apply-patch-mcp
-npm/bin/apply-patch-mcp.exe
+npm/bin/weave-patch-mcp
+npm/bin/weave-patch-mcp.exe
 npm/*.tgz

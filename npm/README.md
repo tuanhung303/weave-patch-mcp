@@ -1,4 +1,4 @@
-# mcp-apply-patch
+# mcp-weave-patch
 
 MCP server for structured file patching using V4A diffs. Create, update, and delete files in one atomic operation.
 
@@ -8,9 +8,9 @@ Add to your MCP configuration:
 
 ```json
 {
-  "patch": {
+  "weave": {
     "command": "npx",
-    "args": ["-y", "mcp-apply-patch"]
+    "args": ["-y", "mcp-weave-patch"]
   }
 }
 ```

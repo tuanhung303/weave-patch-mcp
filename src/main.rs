@@ -1,4 +1,4 @@
-use apply_patch_mcp::server;
+use weave_patch_mcp::server;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
@@ -11,12 +11,12 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Setup tracing to file in ~/.mcp-apply-patch/logs/
+    // Setup tracing to file in ~/.weave-patch/logs/
     let log_dir = dirs::home_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".mcp-apply-patch/logs");
+        .join(".weave-patch/logs");
     std::fs::create_dir_all(&log_dir)?;
-    let file_appender = RollingFileAppender::new(Rotation::DAILY, log_dir, "mcp-apply-patch.log");
+    let file_appender = RollingFileAppender::new(Rotation::DAILY, log_dir, "weave-patch.log");
     let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
 
     tracing_subscriber::registry()
@@ -24,6 +24,6 @@ async fn main() -> anyhow::Result<()> {
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .init();
 
-    tracing::info!("mcp-apply-patch starting");
+    tracing::info!("weave-patch starting");
     server::run().await
 }
