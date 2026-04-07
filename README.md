@@ -88,7 +88,7 @@ Add to your config:
 }
 ```
 
-## Tool: `batch__exec`
+## Tool: `patch__exec`
 
 One tool, one parameter (`patch`). Five operations available in a single atomic call.
 
@@ -316,7 +316,7 @@ cargo test
 | Suite | Coverage |
 |---|---|
 | `tests/integration_test.rs` | Core patch operations, edge cases (Unicode, empty files, long lines, concurrent shadow collision, multi-op atomicity, CRLF) |
-| `tests/server_test.rs` | MCP server, `batch__exec` (globs, line ranges, symbol extraction, patch operations, error handling) |
+| `tests/server_test.rs` | MCP server, `patch__exec` (globs, line ranges, symbol extraction, patch operations, error handling) |
 | `tests/validator_test.rs` | All 7 language-specific advisory validators |
 | `src/parser.rs` (unit) | Compact syntax patch parsing, auto-wrap missing markers, multi-file, hints, Read/Map specs |
 | `src/applier.rs` (unit) | Path validation, fuzzy matching, validators, diff generation, match info |
