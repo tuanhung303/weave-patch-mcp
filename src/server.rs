@@ -532,7 +532,7 @@ impl ApplyPatchServer {
         // Check for null bytes in first 8KB (binary indicator)
         const CHECK_SIZE: usize = 8192;
         let check_len = std::cmp::min(bytes.len(), CHECK_SIZE);
-        if bytes[..check_len].iter().any(|&b| b == 0) {
+        if bytes[..check_len].contains(&0) {
             return Ok("[binary file - content not displayed]".to_string());
         }
 
