@@ -521,8 +521,6 @@ impl Default for ApplyPatchServer {
 #[allow(clippy::unnecessary_cast)]
 fn extract_function_ranges(content: &str) -> Vec<(String, usize, usize)> {
     use regex::Regex;
-
-    // Pattern to find function/class/definition starts
     let patterns = [
         (r"^\s*(?:pub\s+)?(?:async\s+)?fn\s+(\w+)", "rust"),
         (r"^\s*function\s+(\w+)", "js"),
@@ -565,7 +563,6 @@ fn extract_function_ranges(content: &str) -> Vec<(String, usize, usize)> {
         }
     }
 
-    // Sort by start line
     functions.sort_by(|a, b| a.1.cmp(&b.1));
     functions.truncate(5);
     functions
