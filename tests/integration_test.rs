@@ -1,7 +1,7 @@
-use weave_patch_mcp::applier::{weave_patch, weave_patch_with_threshold};
-use weave_patch_mcp::parser::parse_patch;
 use std::fs;
 use tempfile::TempDir;
+use weave_patch_mcp::applier::{weave_patch, weave_patch_with_threshold};
+use weave_patch_mcp::parser::parse_patch;
 
 fn tmp() -> TempDir {
     tempfile::tempdir().unwrap()

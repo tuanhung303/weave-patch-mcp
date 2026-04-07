@@ -308,7 +308,6 @@ impl WeavePatchServer {
         };
 
         tracing::info!("weave_patch result: {}", patch_output);
-   tracing::info!("weave_patch result: {}", patch_output);
 
         if has_error {
             output_parts.push(patch_output);

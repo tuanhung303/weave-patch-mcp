@@ -3,11 +3,11 @@
 //! Note: These tests focus on the underlying reader and applier modules
 //! since the server methods are private tool handlers.
 
-use weave_patch_mcp::applier::{weave_patch, validate_path};
-use weave_patch_mcp::parser::parse_patch;
-use weave_patch_mcp::reader::{apply_line_range, expand_globs, extract_symbols};
 use std::fs;
 use tempfile::TempDir;
+use weave_patch_mcp::applier::{validate_path, weave_patch};
+use weave_patch_mcp::parser::parse_patch;
+use weave_patch_mcp::reader::{apply_line_range, expand_globs, extract_symbols};
 
 fn tmp() -> TempDir {
     tempfile::tempdir().unwrap()
@@ -337,8 +337,8 @@ update file2.txt
 fn server_capabilities_available() {
     // Test that the server type exists and can be instantiated
     // The actual get_info() returns ServerInfo which we can verify
-    use weave_patch_mcp::server::WeavePatchServer;
     use rmcp::ServerHandler;
+    use weave_patch_mcp::server::WeavePatchServer;
 
     let server = WeavePatchServer::new();
     let info = server.get_info();

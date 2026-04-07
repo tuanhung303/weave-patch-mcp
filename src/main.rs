@@ -1,6 +1,6 @@
-use weave_patch_mcp::server;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+use weave_patch_mcp::server;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

@@ -1,8 +1,8 @@
 //! Tests for src/validator.rs - External tool validation
 
-use weave_patch_mcp::validator::validate_file;
 use std::fs;
 use tempfile::TempDir;
+use weave_patch_mcp::validator::validate_file;
 
 fn tmp() -> TempDir {
     tempfile::tempdir().unwrap()
