@@ -116,6 +116,15 @@ All patches are wrapped in `*** Begin Patch` / `*** End Patch` markers.
 *** End Patch
 ```
 
+
+**Read multiple files** (batch read):
+```
+*** Begin Patch
+*** Read File: src/main.rs
+*** Read File: src/lib.rs
+*** Read File: src/config.rs
+*** End Patch
+```
 ### 2. Map a directory
 
 Scan directory structure recursively. Returns files with sizes, line counts, and function signatures (`name: start:end`) at depth 1-3. Skips `node_modules`, `.git`, `target`, binaries.
@@ -179,11 +188,39 @@ Context lines (space-prefixed) anchor the edit. `-` removes, `+` adds.
 *** End Patch
 ```
 
+**Update multiple files** (batch update):
+```
+*** Begin Patch
+*** Update File: src/api.rs
+@@ fn handle
+ fn handle() {
+-    old();
++    new();
+ }
+*** Update File: src/db.rs
+@@ fn connect
+ fn connect() {
+-    let url = "old";
++    let url = "new";
+ }
+*** End Patch
+```
+
 ### 5. Delete a file
 
 ```
 *** Begin Patch
 *** Delete File: src/deprecated.rs
+*** End Patch
+```
+
+
+**Delete multiple files** (batch delete):
+```
+*** Begin Patch
+*** Delete File: src/deprecated1.rs
+*** Delete File: src/deprecated2.rs
+*** Delete File: src/deprecated3.rs
 *** End Patch
 ```
 
