@@ -40,7 +40,7 @@ impl ApplyPatchServer {
 
     #[tool(
         name = "batch__exec",
-        description = "Unified workspace tool: read, map, add, update, and delete files atomically.\nVersion: 2.0.1\n\nFORMAT: wrap everything in === begin / === end.\n\nEXAMPLES:\n\n1. Read a file:\n  === begin\n  read src/main.rs\n  === end\n\n2. Read with symbols:\n  === begin\n  read src/lib.rs symbols=Server,handle_request language=rust\n  === end\n\n3. Read with line range:\n  === begin\n  read config.py offset=10 limit=50\n  === end\n\n4. Map a directory:\n  === begin\n  map src/ depth=2\n  === end\n\n5. Add a new file:\n  === begin\n  create src/hello.rs\n  +pub fn hello() { println!(\\\"Hello!\\\"); }\n  === end\n\n6. Update a file:\n  === begin\n  update src/lib.rs\n  @@ fn main\n   fn main() {\n  -    old_code();\n  +    new_code();\n   }\n  === end\n\n7. Update with multiple hunks:\n  === begin\n  update src/lib.rs\n  @@ fn setup\n   fn setup() {\n  -    old_init();\n  +    new_init();\n   }\n  @@ fn teardown\n   fn teardown() {\n  -    old_cleanup();\n  +    new_cleanup();\n   }\n  === end\n\n8. Rename a file:\n  === begin\n  update src/old.rs\n  move_to src/new.rs\n  @@ fn foo\n   fn foo() { ... }\n  === end\n\n9. Delete a file:\n  === begin\n  delete src/old.rs\n  === end\n\n10. Combined operations:\n  === begin\n  read src/main.rs\n  update src/lib.rs\n  @@ fn main\n   fn main() {\n  -    old();\n  +    new();\n   }\n  create src/greet.rs\n  +pub fn greet() { println!(\\\"hi\\\"); }\n  delete src/deprecated.rs\n  === end\n\n11. Read multiple files:\n  === begin\n  read src/main.rs\n  read src/lib.rs\n  read src/config.rs\n  === end\n\n12. Update multiple files:\n  === begin\n  update src/api.rs\n  @@ fn handle\n   fn handle() {\n  -    old();\n  +    new();\n   }\n  update src/db.rs\n  @@ fn connect\n   fn connect() {\n  -    let url = \"old\";\n  +    let url = \"new\";\n   }\n  === end\n\n13. Delete multiple files:\n  === begin\n  delete src/deprecated1.rs\n  delete src/deprecated2.rs\n  delete src/deprecated3.rs\n  === end\n\nOPTIONS:\n  read <path> [symbols=a,b] [language=rust] [offset=N] [limit=N]\n  map <path> [depth=N] [limit=N]  (default: depth=3, limit=6000)\n  update <path>   @@ hint (optional)   context/ -/ + lines\n  create <path>   +content lines\n  delete <path>   no body needed\n  move_to <path>  (inside Update, renames file)\n\nSECURITY: No path traversal (../), no symlinks, no absolute paths.\n\nVALIDATORS: rustfmt, gofmt, py_compile, json.tool, bash -n, node --check, terraform fmt (advisory)."
+        description = "Unified workspace tool: read, map, add, update, and delete files atomically. Supports batch operations — read multiple files in a single call (prefer over repeated cat/head/tail).\nVersion: 2.0.1\n\nFORMAT: wrap everything in === begin / === end.\n\nEXAMPLES:\n\n1. Read a file:\n  === begin\n  read src/main.rs\n  === end\n\n2. Read with symbols:\n  === begin\n  read src/lib.rs symbols=Server,handle_request language=rust\n  === end\n\n3. Read with line range:\n  === begin\n  read config.py offset=10 limit=50\n  === end\n\n4. Map a directory:\n  === begin\n  map src/ depth=2\n  === end\n\n5. Add a new file (raw text, no +/- prefixes):\n  === begin\n  create src/hello.rs\n  pub fn hello() { println!(\"Hello!\"); }\n  === end\n\n6. Update a file (+/- for changes, preserve indentation):\n  === begin\n  update src/lib.rs\n  @@ fn main\n   fn main() {\n  -    old_code();\n  +    new_code();\n   }\n  === end\n\n7. Update with multiple hunks:\n  === begin\n  update src/lib.rs\n  @@ fn setup\n   fn setup() {\n  -    old_init();\n  +    new_init();\n   }\n  @@ fn teardown\n   fn teardown() {\n  -    old_cleanup();\n  +    new_cleanup();\n   }\n  === end\n\n8. Rename a file:\n  === begin\n  update src/old.rs\n  move_to src/new.rs\n  @@ fn foo\n   fn foo() { ... }\n  === end\n\n9. Delete a file:\n  === begin\n  delete src/old.rs\n  === end\n\n10. Combined operations:\n  === begin\n  read src/main.rs\n  update src/lib.rs\n  @@ fn main\n   fn main() {\n  -    old();\n  +    new();\n   }\n  create src/greet.rs\n  pub fn greet() { println!(\"hi\"); }\n  delete src/deprecated.rs\n  === end\n\n11. Read multiple files:\n  === begin\n  read src/main.rs\n  read src/lib.rs\n  read src/config.rs\n  === end\n\n12. Update multiple files:\n  === begin\n  update src/api.rs\n  @@ fn handle\n   fn handle() {\n  -    old();\n  +    new();\n   }\n  update src/db.rs\n  @@ fn connect\n   fn connect() {\n  -    let url = \"old\";\n  +    let url = \"new\";\n   }\n  === end\n\n13. Delete multiple files:\n  === begin\n  delete src/deprecated1.rs\n  delete src/deprecated2.rs\n  delete src/deprecated3.rs\n  === end\n\nOPTIONS:\n  read <path> [symbols=a,b] [language=rust] [offset=N] [limit=N]\n  map <path> [depth=N] [limit=N]  (default: depth=3, limit=6000)\n  update <path>   @@ hint (optional)   context/ -/ + lines\n  create <path>   content lines (raw text, no prefixes)\n  delete <path>   no body needed\n  move_to <path>  (inside Update, renames file)\n\nUPDATE RULES:\n  - Provide 2-3 unique context lines above and below each change\n  - Preserve exact indentation (whitespace matching is strict)\n  - Use - prefix for lines to remove, + prefix for lines to add\n\nLIMITS:\n  - Files over 1000 lines truncated unless symbols/limit used\n  - Binary files unsupported/ignored\n\nSECURITY: No path traversal (../), no symlinks, no absolute paths.\n\nVALIDATORS: rustfmt, gofmt, py_compile, json.tool, bash -n, node --check, terraform fmt (advisory)."
     )]
     async fn exec(
         &self,
@@ -147,24 +147,46 @@ impl ApplyPatchServer {
                             }
                         };
 
-                        let (formatted, header_suffix) = if let Some(syms) = symbols {
+                        // Apply default 1000-line truncation if no explicit limit/symbols
+                        const DEFAULT_LINE_LIMIT: usize = 1000;
+                        let effective_limit = if symbols.is_some() || limit.is_some() {
+                            *limit // Use explicit limit or None
+                        } else {
+                            Some(DEFAULT_LINE_LIMIT) // Apply default truncation
+                        };
+
+                        let (formatted, header_suffix, truncated_notice) = if let Some(syms) =
+                            symbols
+                        {
                             if !syms.is_empty() {
                                 let lang = language.clone().unwrap_or_else(|| infer_language(path));
                                 let extracted = reader::extract_symbols(&content, &lang, syms);
-                                (extracted, "[symbols]".to_string())
+                                (extracted, "[symbols]".to_string(), String::new())
                             } else {
                                 let (sliced, start, end) =
-                                    reader::apply_line_range(&content, *offset, *limit);
-                                (sliced, format!("[lines {}-{}]", start, end))
+                                    reader::apply_line_range(&content, *offset, effective_limit);
+                                (sliced, format!("[lines {}-{}]", start, end), String::new())
                             }
                         } else {
                             let (sliced, start, end) =
-                                reader::apply_line_range(&content, *offset, *limit);
-                            (sliced, format!("[lines {}-{}]", start, end))
+                                reader::apply_line_range(&content, *offset, effective_limit);
+                            let notice = if limit.is_none()
+                                && content.lines().count() > DEFAULT_LINE_LIMIT
+                            {
+                                format!(
+                                    "\n... [truncated at {} lines - use limit or symbols for full file]",
+                                    DEFAULT_LINE_LIMIT
+                                )
+                            } else {
+                                String::new()
+                            };
+                            (sliced, format!("[lines {}-{}]", start, end), notice)
                         };
 
-                        let mut file_out =
-                            format!("--- {} {} ---\n{}", path, header_suffix, formatted);
+                        let mut file_out = format!(
+                            "--- {} {} ---\n{}{}",
+                            path, header_suffix, formatted, truncated_notice
+                        );
 
                         if file_out.len() > MAX_FILE {
                             file_out.truncate(MAX_FILE);
@@ -502,9 +524,20 @@ impl ApplyPatchServer {
             return Err("Not a regular file".to_string());
         }
 
-        tokio::fs::read_to_string(&full_path)
+        // Binary detection: read bytes first
+        let bytes = tokio::fs::read(&full_path)
             .await
-            .map_err(|e| format!("Read error: {e}"))
+            .map_err(|e| format!("Read error: {e}"))?;
+
+        // Check for null bytes in first 8KB (binary indicator)
+        const CHECK_SIZE: usize = 8192;
+        let check_len = std::cmp::min(bytes.len(), CHECK_SIZE);
+        if bytes[..check_len].iter().any(|&b| b == 0) {
+            return Ok("[binary file - content not displayed]".to_string());
+        }
+
+        // Convert to string, handling UTF-8 errors gracefully
+        String::from_utf8(bytes).map_err(|e| format!("UTF-8 decode error: {e}"))
     }
 }
 

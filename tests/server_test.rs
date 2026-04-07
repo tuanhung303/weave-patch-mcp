@@ -356,8 +356,8 @@ fn batch_add_file_success() {
 
     let patch = r#"=== begin
 create newfile.txt
-+line1
-+line2
+line1
+line2
 === end"#;
 
     let ops = parse_patch(patch).unwrap().ops;

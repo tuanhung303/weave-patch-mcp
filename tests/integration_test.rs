@@ -548,7 +548,7 @@ fn test_mixed_operations_in_patch() {
         "=== begin\n",
         "read keep.txt\n",
         "create new.txt\n",
-        "+New file content\n",
+        "New file content\n",
         "update update.txt\n",
         "-Old content\n",
         "+Updated content\n",
@@ -728,7 +728,7 @@ fn test_conflict_add_update_same_path() {
     let input = concat!(
         "=== begin\n",
         "create conflict.txt\n",
-        "+new content\n",
+        "new content\n",
         "update conflict.txt\n",
         "-old content\n",
         "+updated content\n",

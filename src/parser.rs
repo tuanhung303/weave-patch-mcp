@@ -224,21 +224,16 @@ fn parse_map_spec(spec: &str) -> MapSpec {
 }
 
 fn parse_add_content(lines: &[&str]) -> String {
-    let mut content_lines: Vec<String> = Vec::new();
-    for line in lines {
-        // Accept both "+line" and "  +line" (optional indentation)
-        if let Some(rest) = line
-            .strip_prefix('+')
-            .or_else(|| line.strip_prefix("  +"))
-            .or_else(|| line.strip_prefix("\t+"))
-        {
-            content_lines.push(rest.to_string());
-        }
-    }
-    if content_lines.is_empty() {
+    // Trim trailing empty lines (artifacts from input ending with \n)
+    let lines = match lines.iter().rposition(|l| !l.is_empty()) {
+        Some(idx) => &lines[..=idx],
+        None => return String::new(),
+    };
+
+    if lines.is_empty() {
         String::new()
     } else {
-        content_lines.join("\n") + "\n"
+        lines.join("\n") + "\n"
     }
 }
 
@@ -382,7 +377,7 @@ mod tests {
     #[test]
     fn test_parse_add_file() {
         let input =
-            "=== begin\ncreate src/hello.rs\n+fn hello() {\n+    println!(\"Hello\");\n+}\n=== end";
+            "=== begin\ncreate src/hello.rs\nfn hello() {\n    println!(\"Hello\");\n}\n=== end";
         let result = parse_patch(input).unwrap();
         assert_eq!(result.ops.len(), 1);
         assert!(result.threshold.is_none());
@@ -397,7 +392,8 @@ mod tests {
 
     #[test]
     fn test_parse_add_file_indented() {
-        let input = "=== begin\ncreate src/hello.rs\n  +fn hello() {\n  +    println!(\"Hello\");\n  +}\n=== end";
+        let input =
+            "=== begin\ncreate src/hello.rs\nfn hello() {\n    println!(\"Hello\");\n}\n=== end";
         let result = parse_patch(input).unwrap();
         assert_eq!(result.ops.len(), 1);
         match &result.ops[0] {
@@ -462,7 +458,7 @@ mod tests {
 
     #[test]
     fn test_parse_update_with_context_hint() {
-        let input = "=== begin\nupdate src/lib.rs\n@@ impl Server\n pub fn handle(&self) {\n-    old()\n+    new()\n }\n=== end";
+        let input = "=== begin\nupdate src/lib.rs\n@@ impl Server\n pub fn handle(&self) {\n-    old()\n  +    new()\n }\n=== end";
         let result = parse_patch(input).unwrap();
         match &result.ops[0] {
             FileOp::Update { hunks, .. } => {
@@ -507,7 +503,7 @@ mod tests {
 
     #[test]
     fn test_parse_hint_with_class() {
-        let input = "=== begin\nupdate src/lib.rs\n@@ class Server\n pub struct Server {\n-    old_field: i32,\n+    new_field: i32,\n }\n=== end";
+        let input = "=== begin\nupdate src/lib.rs\n@@ class Server\n pub struct Server {\n-    old_field: i32,\n    new_field: i32,\n }\n=== end";
         let result = parse_patch(input).unwrap();
         match &result.ops[0] {
             FileOp::Update { hunks, .. } => {
@@ -519,7 +515,7 @@ mod tests {
 
     #[test]
     fn test_parse_hint_with_punctuation() {
-        let input = "=== begin\nupdate src/lib.rs\n@@ fn main():\n fn main() {\n-    old()\n+    new()\n }\n=== end";
+        let input = "=== begin\nupdate src/lib.rs\n@@ fn main():\n fn main() {\n-    old()\n  +    new()\n }\n=== end";
         let result = parse_patch(input).unwrap();
         match &result.ops[0] {
             FileOp::Update { hunks, .. } => {
@@ -531,7 +527,7 @@ mod tests {
 
     #[test]
     fn test_parse_indented_context() {
-        let input = "=== begin\nupdate script.py\n@@\n def hello():\n     print(\"hi\")\n-    old_call()\n+    new_call()\n     return\n=== end";
+        let input = "=== begin\nupdate script.py\n@@\n def hello():\n     print(\"hi\")\n-    old_call()\n    new_call()\n     return\n=== end";
         let result = parse_patch(input).unwrap();
         match &result.ops[0] {
             FileOp::Update { hunks, .. } => {
@@ -619,7 +615,7 @@ mod tests {
     #[test]
     fn test_parse_auto_wrap_missing_begin() {
         // Input has end but NOT begin — should still work
-        let input = "create test.txt\n+hello\n=== end";
+        let input = "create test.txt\nhello\n=== end";
         let result = parse_patch(input).unwrap();
         assert_eq!(result.ops.len(), 1);
         match &result.ops[0] {
@@ -646,7 +642,7 @@ mod tests {
     #[test]
     fn test_parse_auto_wrap_both_missing() {
         // Input has NEITHER marker, just raw ops — should still work
-        let input = "create test.txt\n+hello\n";
+        let input = "create test.txt\nhello\n";
         let result = parse_patch(input).unwrap();
         assert_eq!(result.ops.len(), 1);
         match &result.ops[0] {
@@ -660,21 +656,21 @@ mod tests {
 
     #[test]
     fn test_parse_threshold_valid() {
-        let input = "=== begin threshold=0.95\ncreate test.txt\n+hello\n=== end";
+        let input = "=== begin threshold=0.95\ncreate test.txt\nhello\n=== end";
         let result = parse_patch(input).unwrap();
         assert_eq!(result.threshold, Some(0.95));
     }
 
     #[test]
     fn test_parse_threshold_missing() {
-        let input = "=== begin\ncreate test.txt\n+hello\n=== end";
+        let input = "=== begin\ncreate test.txt\nhello\n=== end";
         let result = parse_patch(input).unwrap();
         assert!(result.threshold.is_none());
     }
 
     #[test]
     fn test_parse_threshold_invalid_value() {
-        let input = "=== begin threshold=invalid\ncreate test.txt\n+hello\n=== end";
+        let input = "=== begin threshold=invalid\ncreate test.txt\nhello\n=== end";
         let result = parse_patch(input);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -683,7 +679,7 @@ mod tests {
 
     #[test]
     fn test_parse_threshold_out_of_range() {
-        let input = "=== begin threshold=1.5\ncreate test.txt\n+hello\n=== end";
+        let input = "=== begin threshold=1.5\ncreate test.txt\nhello\n=== end";
         let result = parse_patch(input);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
