@@ -1281,7 +1281,7 @@ dependencies = [
 
 [[package]]
 name = "weave-patch-mcp"
-version = "2.0.2"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "dirs",
