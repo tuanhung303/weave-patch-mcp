@@ -22,6 +22,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@0c366fd6a839edf440554fa01a7085ccba70ac98 # v4.x
+        with:
+          fetch-depth: 0  # Fetch full history for proper push
 
       - name: Configure git user
         run: |
@@ -62,5 +64,6 @@ jobs:
         env:
           GIT_HTTP_USER: ${{ secrets.GITHUB_ACTOR }}
         run: |
+          git pull --rebase origin main
           git push origin main
           git push origin v${{ steps.new_version.outputs.NEW_VERSION }}
