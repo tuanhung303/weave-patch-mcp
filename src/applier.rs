@@ -12,11 +12,29 @@ use similar::TextDiff;
 /// Higher threshold reduces false positives in context matching.
 pub const FUZZY_THRESHOLD: f32 = 0.97;
 
+/// Semantic status for operation results.
+/// Enables programmatic handling of outcomes beyond string matching.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OpStatus {
+    /// Operation completed successfully
+    #[default]
+    Ok,
+    /// Operation skipped (no-op, already in desired state)
+    Skipped,
+    /// Non-fatal error that may allow other operations to continue
+    RecoverableError,
+    /// Fatal error that blocks further processing
+    FatalError,
+    /// Validation warning (syntax/format issues, non-blocking)
+    ValidationWarning,
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct OpResult {
     pub path: String,
     pub op_type: String,
-    pub status: String,
+    pub status: OpStatus,
     pub message: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
@@ -26,6 +44,12 @@ pub struct OpResult {
     pub line_changes: Option<(usize, usize)>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub match_info: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llm_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_total: Option<usize>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -40,16 +64,25 @@ pub struct PatchResult {
 }
 
 #[must_use]
-fn make_op(path: &str, op_type: &str, status: &str, message: &str) -> OpResult {
+fn make_op(
+    path: &str,
+    op_type: &str,
+    status: OpStatus,
+    message: &str,
+    batch: Option<(usize, usize)>,
+) -> OpResult {
     OpResult {
         path: path.to_string(),
         op_type: op_type.to_string(),
-        status: status.to_string(),
+        status,
         message: message.to_string(),
         warnings: vec![],
         diff: None,
         line_changes: None,
         match_info: None,
+        llm_error: None,
+        batch_index: batch.map(|(idx, _)| idx),
+        batch_total: batch.map(|(_, total)| total),
     }
 }
 
@@ -216,9 +249,11 @@ pub fn weave_patch_with_threshold(
     // Step 1: Detect conflicts before any I/O
     if let Err((path, msg)) = detect_file_conflicts(&ops) {
         // Return error for the conflicting operation
+        let total = ops.len();
         let results: Vec<OpResult> = ops
             .iter()
-            .map(|op| {
+            .enumerate()
+            .map(|(i, op)| {
                 let op_type = match op {
                     FileOp::Add { .. } => "add",
                     FileOp::Update { .. } => "update",
@@ -234,9 +269,21 @@ pub fn weave_patch_with_threshold(
                     FileOp::Map { path, .. } => path,
                 };
                 if op_path == &path {
-                    make_op(op_path, op_type, "error", &msg)
+                    make_op(
+                        op_path,
+                        op_type,
+                        OpStatus::FatalError,
+                        &msg,
+                        Some((i + 1, total)),
+                    )
                 } else {
-                    make_op(op_path, op_type, "skipped", "Skipped due to conflict")
+                    make_op(
+                        op_path,
+                        op_type,
+                        OpStatus::Skipped,
+                        "Skipped due to conflict",
+                        Some((i + 1, total)),
+                    )
                 }
             })
             .collect();
@@ -249,19 +296,33 @@ pub fn weave_patch_with_threshold(
 
     // Step 2: Prepare phase - parallel execution using rayon
     // We need to preserve operation order for results, so we collect with indices
+    let total = ops.len();
     let results: Vec<(usize, OpResult)> = ops
         .into_iter()
         .enumerate()
         .collect::<Vec<_>>()
         .into_par_iter()
-        .map(|(idx, op)| (idx, prepare_op(op, base_dir, &transaction, threshold)))
+        .map(|(idx, op)| {
+            (
+                idx,
+                prepare_op(
+                    op,
+                    base_dir,
+                    &transaction,
+                    threshold,
+                    Some((idx + 1, total)),
+                ),
+            )
+        })
         .collect();
 
     // Sort results by original index to preserve order
     let mut results: Vec<OpResult> = results.into_iter().map(|(_, r)| r).collect();
 
     // Check if any operation failed
-    let failed = results.iter().any(|r| r.status == "error");
+    let failed = results
+        .iter()
+        .any(|r| r.status == OpStatus::FatalError || r.status == OpStatus::RecoverableError);
 
     // If any op failed, Drop cleans up shadow files
     if failed {
@@ -275,8 +336,8 @@ pub fn weave_patch_with_threshold(
         // Mark all "ok" ops as failed due to commit error
         let msg = format!("Commit failed: {e}");
         for r in &mut results {
-            if r.status == "ok" {
-                r.status = "error".to_string();
+            if r.status == OpStatus::Ok {
+                r.status = OpStatus::FatalError;
                 r.message = msg.clone();
             }
         }
@@ -293,22 +354,23 @@ fn prepare_op(
     base_dir: &Path,
     tx: &PatchTransaction,
     threshold: Option<f32>,
+    batch: Option<(usize, usize)>,
 ) -> OpResult {
     match op {
         FileOp::Add { path, content } => {
             let full_path = match validate_path(base_dir, &path) {
                 Ok(p) => p,
-                Err(e) => return make_op(&path, "add", "error", &e.to_string()),
+                Err(e) => return make_error_op(&path, "add", &e, batch),
             };
             match stage_add(&full_path, &content, tx) {
                 Ok(result) => {
-                    let mut op = make_op(&path, "add", "ok", &result.message);
+                    let mut op = make_op(&path, "add", OpStatus::Ok, &result.message, batch);
                     op.warnings = result.warnings;
                     op.diff = result.diff;
                     op.line_changes = result.line_changes;
                     op
                 }
-                Err(e) => make_op(&path, "add", "error", &e.to_string()),
+                Err(e) => make_error_op(&path, "add", &e, batch),
             }
         }
         FileOp::Delete { path } => {
@@ -316,11 +378,11 @@ fn prepare_op(
                 .and_then(|full_path| stage_delete(&full_path, &path, tx))
             {
                 Ok(result) => {
-                    let mut op = make_op(&path, "delete", "ok", &result.message);
+                    let mut op = make_op(&path, "delete", OpStatus::Ok, &result.message, batch);
                     op.line_changes = result.line_changes;
                     op
                 }
-                Err(e) => make_op(&path, "delete", "error", &e.to_string()),
+                Err(e) => make_error_op(&path, "delete", &e, batch),
             }
         }
         FileOp::Update {
@@ -330,7 +392,7 @@ fn prepare_op(
         } => {
             let full_path = match validate_path(base_dir, &path) {
                 Ok(p) => p,
-                Err(e) => return make_op(&path, "update", "error", &e.to_string()),
+                Err(e) => return make_error_op(&path, "update", &e, batch),
             };
 
             match stage_update(&full_path, &path, &hunks, tx, threshold) {
@@ -342,8 +404,9 @@ fn prepare_op(
                                 return make_op(
                                     &path,
                                     "update",
-                                    "error",
+                                    OpStatus::FatalError,
                                     &format!("Update succeeded but move_to invalid: {e}"),
+                                    batch,
                                 );
                             }
                         };
@@ -359,8 +422,9 @@ fn prepare_op(
                         let mut op = make_op(
                             &path,
                             "update",
-                            "ok",
+                            OpStatus::Ok,
                             &format!("File updated and moved to {dest}"),
+                            batch,
                         );
                         op.warnings = result.warnings;
                         op.diff = result.diff;
@@ -368,7 +432,7 @@ fn prepare_op(
                         op.match_info = result.match_info;
                         op
                     } else {
-                        let mut op = make_op(&path, "update", "ok", &result.message);
+                        let mut op = make_op(&path, "update", OpStatus::Ok, &result.message, batch);
                         op.warnings = result.warnings;
                         op.diff = result.diff;
                         op.line_changes = result.line_changes;
@@ -376,7 +440,7 @@ fn prepare_op(
                         op
                     }
                 }
-                Err(e) => make_op(&path, "update", "error", &e.to_string()),
+                Err(e) => make_error_op(&path, "update", &e, batch),
             }
         }
         FileOp::Read {
@@ -390,23 +454,53 @@ fn prepare_op(
             match validate_path(base_dir, &path) {
                 Ok(full_path) => {
                     if !full_path.exists() {
-                        return make_op(&path, "read", "error", "File not found");
+                        return make_op(
+                            &path,
+                            "read",
+                            OpStatus::FatalError,
+                            "File not found",
+                            batch,
+                        );
                     }
                     let meta = match full_path.symlink_metadata() {
                         Ok(m) => m,
                         Err(e) => {
-                            return make_op(&path, "read", "error", &format!("IO error: {e}"));
+                            return make_op(
+                                &path,
+                                "read",
+                                OpStatus::FatalError,
+                                &format!("IO error: {e}"),
+                                batch,
+                            );
                         }
                     };
                     if meta.file_type().is_symlink() {
-                        return make_op(&path, "read", "error", "Symlink rejected");
+                        return make_op(
+                            &path,
+                            "read",
+                            OpStatus::FatalError,
+                            "Symlink rejected",
+                            batch,
+                        );
                     }
                     if !meta.is_file() {
-                        return make_op(&path, "read", "error", "Not a regular file");
+                        return make_op(
+                            &path,
+                            "read",
+                            OpStatus::FatalError,
+                            "Not a regular file",
+                            batch,
+                        );
                     }
-                    make_op(&path, "read", "ok", &format!("read: {} (ok)", path))
+                    make_op(
+                        &path,
+                        "read",
+                        OpStatus::Ok,
+                        &format!("read: {} (ok)", path),
+                        batch,
+                    )
                 }
-                Err(e) => make_op(&path, "read", "error", &e.to_string()),
+                Err(e) => make_error_op(&path, "read", &e, batch),
             }
         }
         FileOp::Map {
@@ -416,14 +510,32 @@ fn prepare_op(
         } => match validate_path(base_dir, &path) {
             Ok(full_path) => {
                 if !full_path.exists() {
-                    return make_op(&path, "map", "error", "Directory not found");
+                    return make_op(
+                        &path,
+                        "map",
+                        OpStatus::FatalError,
+                        "Directory not found",
+                        batch,
+                    );
                 }
                 if !full_path.is_dir() {
-                    return make_op(&path, "map", "error", "Path is not a directory");
+                    return make_op(
+                        &path,
+                        "map",
+                        OpStatus::FatalError,
+                        "Path is not a directory",
+                        batch,
+                    );
                 }
-                make_op(&path, "map", "ok", &format!("map: {} (ok)", path))
+                make_op(
+                    &path,
+                    "map",
+                    OpStatus::Ok,
+                    &format!("map: {} (ok)", path),
+                    batch,
+                )
             }
-            Err(e) => make_op(&path, "map", "error", &e.to_string()),
+            Err(e) => make_error_op(&path, "map", &e, batch),
         },
     }
 }
@@ -1175,7 +1287,7 @@ mod tests {
             content: "hello\nworld\n".to_string(),
         }];
         let result = weave_patch(ops, dir.path());
-        assert_eq!(result.operations[0].status, "ok");
+        assert_eq!(result.operations[0].status, OpStatus::Ok);
         assert_eq!(
             fs::read_to_string(dir.path().join("hello.txt")).unwrap(),
             "hello\nworld\n"
@@ -1206,7 +1318,7 @@ mod tests {
             content: "nested\n".to_string(),
         }];
         let result = weave_patch(ops, dir.path());
-        assert_eq!(result.operations[0].status, "ok");
+        assert_eq!(result.operations[0].status, OpStatus::Ok);
         assert!(dir.path().join("a/b/c.txt").exists());
     }
 
@@ -1220,7 +1332,7 @@ mod tests {
             path: "target.txt".to_string(),
         }];
         let result = weave_patch(ops, dir.path());
-        assert_eq!(result.operations[0].status, "ok");
+        assert_eq!(result.operations[0].status, OpStatus::Ok);
         assert!(!file_path.exists());
     }
 
@@ -1235,7 +1347,7 @@ mod tests {
             path: "target.txt".to_string(),
         }];
         let result = weave_patch(ops, dir.path());
-        assert_eq!(result.operations[0].status, "ok");
+        assert_eq!(result.operations[0].status, OpStatus::Ok);
         assert_eq!(result.operations[0].line_changes, Some((4, 0)));
         assert!(result.operations[0].message.contains("delete:"));
         assert!(result.operations[0].message.contains("(was 4 lines)"));
@@ -1262,7 +1374,8 @@ mod tests {
         }];
         let result = weave_patch(ops, dir.path());
         assert_eq!(
-            result.operations[0].status, "ok",
+            result.operations[0].status,
+            OpStatus::Ok,
             "{}",
             result.operations[0].message
         );
@@ -1290,7 +1403,7 @@ mod tests {
             move_to: None,
         }];
         let result = weave_patch(ops, dir.path());
-        assert_eq!(result.operations[0].status, "ok");
+        assert_eq!(result.operations[0].status, OpStatus::Ok);
 
         // Should have diff
         assert!(result.operations[0].diff.is_some());
@@ -1345,7 +1458,8 @@ mod tests {
         }];
         let result = weave_patch(ops, dir.path());
         assert_eq!(
-            result.operations[0].status, "ok",
+            result.operations[0].status,
+            OpStatus::Ok,
             "{}",
             result.operations[0].message
         );
@@ -1370,7 +1484,7 @@ mod tests {
             move_to: None,
         }];
         let result = weave_patch(ops, dir.path());
-        assert_eq!(result.operations[0].status, "error");
+        assert_eq!(result.operations[0].status, OpStatus::FatalError);
         assert!(
             result.operations[0].message.contains("not found")
                 || result.operations[0].message.contains("File not found")
@@ -1396,7 +1510,7 @@ mod tests {
             move_to: None,
         }];
         let result = weave_patch(ops, dir.path());
-        assert_eq!(result.operations[0].status, "error");
+        assert_eq!(result.operations[0].status, OpStatus::RecoverableError);
         assert!(
             result.operations[0].message.contains("context not found")
                 || result.operations[0].message.contains("locate hunk")
@@ -1419,8 +1533,8 @@ mod tests {
             },
         ];
         let result = weave_patch(ops, dir.path());
-        assert_eq!(result.operations[0].status, "ok");
-        assert_eq!(result.operations[1].status, "ok");
+        assert_eq!(result.operations[0].status, OpStatus::Ok);
+        assert_eq!(result.operations[0].status, OpStatus::Ok);
         assert!(dir.path().join("new.txt").exists());
         assert!(!existing.exists());
     }
@@ -1440,7 +1554,7 @@ mod tests {
         let parent = dir.path().parent().unwrap();
         let _ = fs::create_dir_all(parent);
         // The operation should succeed or fail with a different error (not traversal)
-        if result.operations[0].status == "ok" {
+        if result.operations[0].status == OpStatus::Ok {
             // Successfully created file outside base dir
             assert!(parent.join("outside_file.txt").exists());
             // Cleanup
@@ -1467,7 +1581,8 @@ mod tests {
         let result = weave_patch(ops, dir.path());
         // Should succeed in deleting the sibling file
         assert_eq!(
-            result.operations[0].status, "ok",
+            result.operations[0].status,
+            OpStatus::Ok,
             "Expected ok, got: {}",
             result.operations[0].message
         );
@@ -1485,7 +1600,7 @@ mod tests {
         }];
         let result = weave_patch(ops, dir.path());
         // Should succeed (or fail with permission error, not traversal)
-        if result.operations[0].status == "ok" {
+        if result.operations[0].status == OpStatus::Ok {
             // Cleanup
             let _ = fs::remove_file(&unique_name);
         }
@@ -1511,7 +1626,7 @@ mod tests {
             path: "link.txt".to_string(),
         }];
         let result = weave_patch(ops, dir.path());
-        assert_eq!(result.operations[0].status, "error");
+        assert_eq!(result.operations[0].status, OpStatus::FatalError);
         assert!(
             result.operations[0].message.contains("ymlink"),
             "expected symlink error, got: {}",
@@ -1542,7 +1657,7 @@ mod tests {
             move_to: None,
         }];
         let result = weave_patch(ops, dir.path());
-        assert_eq!(result.operations[0].status, "error");
+        assert_eq!(result.operations[0].status, OpStatus::FatalError);
         assert!(
             result.operations[0].message.contains("ymlink"),
             "expected symlink error, got: {}",
@@ -1564,7 +1679,8 @@ mod tests {
         let result = weave_patch(ops, dir.path());
         // Should succeed - file created inside the temp dir
         assert_eq!(
-            result.operations[0].status, "ok",
+            result.operations[0].status,
+            OpStatus::Ok,
             "Expected ok, got: {}",
             result.operations[0].message
         );
@@ -1583,7 +1699,7 @@ mod tests {
         }];
         let result = weave_patch(ops, dir.path());
         // Should succeed (creates file with backslash in name on Unix)
-        if result.operations[0].status == "ok" {
+        if result.operations[0].status == OpStatus::Ok {
             // Cleanup
             let _ = fs::remove_file(dir.path().join("sub\\file.txt"));
         }
@@ -1620,7 +1736,8 @@ mod tests {
         // With 0.97 default, this would fail due to low similarity
         let result = weave_patch_with_threshold(ops, dir.path(), Some(0.85));
         assert_eq!(
-            result.operations[0].status, "ok",
+            result.operations[0].status,
+            OpStatus::Ok,
             "Phase 2/3 match should succeed with 0.85 threshold: {}",
             result.operations[0].message
         );
@@ -1670,7 +1787,8 @@ mod tests {
         // With 0.97 default, this would fail (similarity ~95%)
         let result = weave_patch_with_threshold(ops, dir.path(), Some(0.85));
         assert_eq!(
-            result.operations[0].status, "ok",
+            result.operations[0].status,
+            OpStatus::Ok,
             "Phase 3 fuzzy match should succeed with 0.85 threshold: {}",
             result.operations[0].message
         );
@@ -1705,7 +1823,8 @@ mod tests {
         let result = weave_patch(ops, dir.path());
         // Should fail — fuzzy must not run for 2-line patterns (context only = 1 line before Remove)
         assert_eq!(
-            result.operations[0].status, "error",
+            result.operations[0].status,
+            OpStatus::RecoverableError,
             "Short 2-line pattern must not fuzzy match"
         );
     }
@@ -1736,7 +1855,8 @@ mod tests {
         let result = weave_patch(ops, dir.path());
         // Should fail — fuzzy skipped for large files
         assert_eq!(
-            result.operations[0].status, "error",
+            result.operations[0].status,
+            OpStatus::RecoverableError,
             "Large file must not fuzzy match: {}",
             result.operations[0].message
         );
@@ -1772,8 +1892,8 @@ mod tests {
         ];
         let result = weave_patch(ops, dir.path());
         // Op1 staged ok, op2 failed
-        assert_eq!(result.operations[0].status, "ok");
-        assert_eq!(result.operations[1].status, "error");
+        assert_eq!(result.operations[0].status, OpStatus::Ok);
+        assert_eq!(result.operations[1].status, OpStatus::FatalError);
         // file1 must be UNCHANGED because commit was rolled back
         let content = fs::read_to_string(&file1).unwrap();
         assert_eq!(
@@ -1875,7 +1995,7 @@ mod tests {
             },
         ];
         let result = weave_patch(ops, dir.path());
-        assert!(result.operations.iter().all(|o| o.status == "ok"));
+        assert!(result.operations.iter().all(|o| o.status == OpStatus::Ok));
         assert_eq!(
             fs::read_to_string(dir.path().join("f1.txt")).unwrap(),
             "alpha\nBETA\n"
@@ -1911,7 +2031,7 @@ mod tests {
             move_to: None,
         }];
         let result = weave_patch(ops, dir.path());
-        assert_eq!(result.operations[0].status, "error");
+        assert_eq!(result.operations[0].status, OpStatus::RecoverableError);
         assert!(result.operations[0].message.contains("context not found:"));
     }
 
@@ -2071,7 +2191,7 @@ echo hello
         }];
         let result = weave_patch(ops, dir.path());
         assert_eq!(result.operations.len(), 1);
-        assert_eq!(result.operations[0].status, "ok");
+        assert_eq!(result.operations[0].status, OpStatus::Ok);
         assert_eq!(result.operations[0].op_type, "read");
     }
 
@@ -2087,7 +2207,7 @@ echo hello
         }];
         let result = weave_patch(ops, dir.path());
         assert_eq!(result.operations.len(), 1);
-        assert_eq!(result.operations[0].status, "error");
+        assert_eq!(result.operations[0].status, OpStatus::FatalError);
         assert_eq!(result.operations[0].op_type, "read");
     }
 
@@ -2108,7 +2228,7 @@ echo hello
         }];
         let result = weave_patch(ops, dir.path());
         assert_eq!(result.operations.len(), 1);
-        assert_eq!(result.operations[0].status, "error");
+        assert_eq!(result.operations[0].status, OpStatus::FatalError);
         assert!(result.operations[0].message.contains("Symlink"));
     }
 
@@ -2132,11 +2252,106 @@ echo hello
         // Should succeed in reading the sibling file
         assert_eq!(result.operations.len(), 1);
         assert_eq!(
-            result.operations[0].status, "ok",
+            result.operations[0].status,
+            OpStatus::Ok,
             "Expected ok, got: {}",
             result.operations[0].message
         );
         // Cleanup
         let _ = fs::remove_file(&sibling_file);
+    }
+}
+fn make_error_op(
+    path: &str,
+    op_type: &str,
+    error: &crate::error::PatchError,
+    batch: Option<(usize, usize)>,
+) -> OpResult {
+    use crate::error::PatchError;
+
+    let status = match error {
+        // Recoverable: context issues that might work with different hunks
+        PatchError::ContextNotFound { .. } => OpStatus::RecoverableError,
+        PatchError::AmbiguousContext { .. } => OpStatus::RecoverableError,
+
+        // Fatal: file system issues that block the operation
+        PatchError::FileNotFound { .. } => OpStatus::FatalError,
+        PatchError::FileAlreadyExists { .. } => OpStatus::FatalError,
+        PatchError::SymlinkRejected { .. } => OpStatus::FatalError,
+        PatchError::Io(_) => OpStatus::FatalError,
+
+        // Parse errors are fatal for the patch but recoverable for other operations
+        PatchError::Parse(_) => OpStatus::FatalError,
+    };
+
+    let llm_error = serde_json::to_string(&error.to_json()).ok();
+    let mut op = make_op(path, op_type, status, &error.to_string(), batch);
+    op.llm_error = llm_error;
+    op
+}
+
+#[cfg(test)]
+mod opstatus_serde_tests {
+    use super::OpStatus;
+
+    #[test]
+    fn test_opstatus_serialization() {
+        assert_eq!(serde_json::to_string(&OpStatus::Ok).unwrap(), "\"ok\"");
+        assert_eq!(
+            serde_json::to_string(&OpStatus::Skipped).unwrap(),
+            "\"skipped\""
+        );
+        assert_eq!(
+            serde_json::to_string(&OpStatus::RecoverableError).unwrap(),
+            "\"recoverable_error\""
+        );
+        assert_eq!(
+            serde_json::to_string(&OpStatus::FatalError).unwrap(),
+            "\"fatal_error\""
+        );
+        assert_eq!(
+            serde_json::to_string(&OpStatus::ValidationWarning).unwrap(),
+            "\"validation_warning\""
+        );
+    }
+
+    #[test]
+    fn test_opstatus_deserialization() {
+        assert_eq!(
+            serde_json::from_str::<OpStatus>("\"ok\"").unwrap(),
+            OpStatus::Ok
+        );
+        assert_eq!(
+            serde_json::from_str::<OpStatus>("\"skipped\"").unwrap(),
+            OpStatus::Skipped
+        );
+        assert_eq!(
+            serde_json::from_str::<OpStatus>("\"recoverable_error\"").unwrap(),
+            OpStatus::RecoverableError
+        );
+        assert_eq!(
+            serde_json::from_str::<OpStatus>("\"fatal_error\"").unwrap(),
+            OpStatus::FatalError
+        );
+        assert_eq!(
+            serde_json::from_str::<OpStatus>("\"validation_warning\"").unwrap(),
+            OpStatus::ValidationWarning
+        );
+    }
+
+    #[test]
+    fn test_opstatus_default() {
+        assert_eq!(OpStatus::default(), OpStatus::Ok);
+    }
+
+    #[test]
+    fn test_opstatus_old_status_migration() {
+        // Verify that old "error" status does NOT deserialize to anything
+        // This documents the breaking change
+        let result = serde_json::from_str::<OpStatus>("\"error\"");
+        assert!(
+            result.is_err(),
+            "Old 'error' status should fail to deserialize"
+        );
     }
 }

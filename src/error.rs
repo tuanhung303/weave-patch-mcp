@@ -115,7 +115,7 @@ impl PatchError {
                 expected_context: vec![format!("Ambiguous: {} matches found", count)],
                 actual_content: context_at_each.join("\n---\n"),
                 similarity_score: None,
-                suggested_action: "add_unique_context".to_string(),
+                suggested_action: "add_disambiguating_context_lines".to_string(),
                 recovery_hint: format!(
                     "Add more context lines to disambiguate {} matches at lines: {}",
                     count,
@@ -133,7 +133,7 @@ impl PatchError {
                 expected_context: vec![],
                 actual_content: String::new(),
                 similarity_score: None,
-                suggested_action: "create_file_first".to_string(),
+                suggested_action: "create_target_file_before_patch".to_string(),
                 recovery_hint: format!(
                     "File '{}' does not exist. Create it first or check path.",
                     path
@@ -146,7 +146,7 @@ impl PatchError {
                 expected_context: vec![],
                 actual_content: String::new(),
                 similarity_score: None,
-                suggested_action: "use_update_not_add".to_string(),
+                suggested_action: "use_update_operation_for_existing_file".to_string(),
                 recovery_hint: format!(
                     "File '{}' already exists. Use Update instead of Add.",
                     path
@@ -159,7 +159,7 @@ impl PatchError {
                 expected_context: vec![],
                 actual_content: msg.clone(),
                 similarity_score: None,
-                suggested_action: "fix_patch_syntax".to_string(),
+                suggested_action: "correct_syntax_in_patch_block".to_string(),
                 recovery_hint: format!("Patch syntax error: {}", msg),
             },
             PatchError::SymlinkRejected(path) => LLMErrorOutput {

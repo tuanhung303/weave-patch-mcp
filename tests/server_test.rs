@@ -249,7 +249,8 @@ update test.txt
     let result = weave_patch(ops, dir.path());
 
     assert_eq!(
-        result.operations[0].status, "ok",
+        result.operations[0].status,
+        OpStatus::Ok,
         "Should succeed: {}",
         result.operations[0].message
     );
@@ -280,7 +281,8 @@ update test.txt
     let result = weave_patch(ops, dir.path());
 
     assert_eq!(
-        result.operations[0].status, "error",
+        result.operations[0].status,
+        OpStatus::RecoverableError,
         "Should return error status"
     );
     assert!(
@@ -318,7 +320,10 @@ update file2.txt
     let result = weave_patch(ops, dir.path());
 
     // Both should fail due to atomic behavior
-    let has_error = result.operations.iter().any(|op| op.status == "error");
+    let has_error = result
+        .operations
+        .iter()
+        .any(|op| op.status == OpStatus::FatalError || op.status == OpStatus::RecoverableError);
     assert!(has_error, "Should have at least one error");
 
     // Check that file1 wasn't modified either (atomic rollback)
@@ -364,7 +369,8 @@ line2
     let result = weave_patch(ops, dir.path());
 
     assert_eq!(
-        result.operations[0].status, "ok",
+        result.operations[0].status,
+        OpStatus::Ok,
         "Should succeed: {}",
         result.operations[0].message
     );
@@ -392,7 +398,8 @@ delete todelete.txt
     let result = weave_patch(ops, dir.path());
 
     assert_eq!(
-        result.operations[0].status, "ok",
+        result.operations[0].status,
+        OpStatus::Ok,
         "Should succeed: {}",
         result.operations[0].message
     );
@@ -425,3 +432,4 @@ move_to new.txt
     // Either old was moved to new, or old was updated
     assert!(new_exists || old_exists, "Either old or new should exist");
 }
+use weave_patch_mcp::applier::OpStatus;

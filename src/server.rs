@@ -25,6 +25,14 @@ pub struct BatchExecParams {
     pub threshold: Option<f32>,
 }
 
+/// Metrics tracked during map operations.
+#[derive(Debug, Clone, Default)]
+pub struct MapMetrics {
+    pub file_count: usize,
+    pub total_lines: usize,
+    pub max_depth: usize,
+}
+
 #[derive(Clone)]
 pub struct WeavePatchServer {
     tool_router: ToolRouter<Self>,
@@ -155,6 +163,7 @@ impl WeavePatchServer {
                             Some(DEFAULT_LINE_LIMIT) // Apply default truncation
                         };
 
+                        let total_lines = content.lines().count();
                         let (formatted, header_suffix, truncated_notice) = if let Some(syms) =
                             symbols
                         {
@@ -165,7 +174,11 @@ impl WeavePatchServer {
                             } else {
                                 let (sliced, start, end) =
                                     reader::apply_line_range(&content, *offset, effective_limit);
-                                (sliced, format!("[lines {}-{}]", start, end), String::new())
+                                (
+                                    sliced,
+                                    format!("[lines {}-{} of {}]", start, end, total_lines),
+                                    String::new(),
+                                )
                             }
                         } else {
                             let (sliced, start, end) =
@@ -180,7 +193,11 @@ impl WeavePatchServer {
                             } else {
                                 String::new()
                             };
-                            (sliced, format!("[lines {}-{}]", start, end), notice)
+                            (
+                                sliced,
+                                format!("[lines {}-{} of {}]", start, end, total_lines),
+                                notice,
+                            )
                         };
 
                         let mut file_out = format!(
@@ -219,23 +236,71 @@ impl WeavePatchServer {
             parse_result.threshold.or(params.threshold),
         );
 
-        let has_error = result.operations.iter().any(|op| op.status == "error");
+        let has_error = result
+            .operations
+            .iter()
+            .any(|op| op.status == OpStatus::FatalError || op.status == OpStatus::RecoverableError);
 
         let patch_output = if has_error {
             result
                 .operations
                 .iter()
-                .filter(|op| op.status == "error")
+                .filter(|op| {
+                    op.status == OpStatus::FatalError || op.status == OpStatus::RecoverableError
+                })
                 .map(|op| {
-                    format!(
+                    let base = format!(
                         "[ERROR] {} \u{2014} {}: {}",
                         op.op_type, op.path, op.message
-                    )
+                    );
+                    if let Some(ref llm_json) = op.llm_error {
+                        format!("{}\n```json\n{}\n```", base, llm_json)
+                    } else {
+                        base
+                    }
                 })
                 .collect::<Vec<_>>()
                 .join("\n")
         } else {
+            // Count operations by type for summary header
+            let creates = result
+                .operations
+                .iter()
+                .filter(|op| op.op_type == "add")
+                .count();
+            let updates = result
+                .operations
+                .iter()
+                .filter(|op| op.op_type == "update")
+                .count();
+            let deletes = result
+                .operations
+                .iter()
+                .filter(|op| op.op_type == "delete")
+                .count();
+            let total = result.operations.len();
+
             let mut lines: Vec<String> = Vec::new();
+
+            // Prepend summary header for write operations
+            if creates + updates + deletes > 0 {
+                let mut summary = format!("✓ {} operations completed", total);
+                let mut parts = Vec::new();
+                if creates > 0 {
+                    parts.push(format!("{} created", creates));
+                }
+                if updates > 0 {
+                    parts.push(format!("{} updated", updates));
+                }
+                if deletes > 0 {
+                    parts.push(format!("{} deleted", deletes));
+                }
+                if !parts.is_empty() {
+                    summary.push_str(&format!(" ({})", parts.join(", ")));
+                }
+                lines.push(summary);
+            }
+
             for op in &result.operations {
                 let warn_suffix = if op.warnings.is_empty() {
                     String::new()
@@ -243,34 +308,44 @@ impl WeavePatchServer {
                     format!(" [warnings: {}]", op.warnings.join("; "))
                 };
 
+                let batch_suffix = format_batch(&op.batch_index, &op.batch_total);
                 let header = match op.op_type.as_str() {
                     "update" => {
                         if let Some((before, after)) = op.line_changes {
                             format!(
-                                "[成功] {} \u{2014} {} ({} \u{2192} {} lines){}",
-                                op.op_type, op.path, before, after, warn_suffix
+                                "✓ {} \u{2014} {} ({} \u{2192} {} lines){}{}",
+                                op.op_type, op.path, before, after, warn_suffix, batch_suffix
                             )
                         } else {
-                            format!("[成功] {} \u{2014} {}{}", op.op_type, op.path, warn_suffix)
+                            format!(
+                                "✓ {} \u{2014} {}{}{}",
+                                op.op_type, op.path, warn_suffix, batch_suffix
+                            )
                         }
                     }
                     "add" => {
                         if let Some((_, after)) = op.line_changes {
                             format!(
-                                "[成功] {} \u{2014} {} ({} lines){}",
-                                op.op_type, op.path, after, warn_suffix
+                                "✓ {} \u{2014} {} ({} lines){}{}",
+                                op.op_type, op.path, after, warn_suffix, batch_suffix
                             )
                         } else {
-                            format!("[成功] {} \u{2014} {}{}", op.op_type, op.path, warn_suffix)
+                            format!(
+                                "✓ {} \u{2014} {}{}{}",
+                                op.op_type, op.path, warn_suffix, batch_suffix
+                            )
                         }
                     }
                     "delete" => {
                         format!(
-                            "[成功] {} \u{2014} {} ({}){}",
-                            op.op_type, op.path, op.message, warn_suffix
+                            "✓ {} \u{2014} {} ({}){}{}",
+                            op.op_type, op.path, op.message, warn_suffix, batch_suffix
                         )
                     }
-                    _ => format!("[成功] {} \u{2014} {}{}", op.op_type, op.path, warn_suffix),
+                    _ => format!(
+                        "✓ {} \u{2014} {}{}{}",
+                        op.op_type, op.path, warn_suffix, batch_suffix
+                    ),
                 };
 
                 lines.push(header);
@@ -348,31 +423,49 @@ impl WeavePatchServer {
         }
 
         let map_result = timeout(Duration::from_secs(3), async {
-            self.map_directory(&full_path, max_depth, output_limit, 0)
+            self.map_directory_with_metrics(&full_path, max_depth, output_limit, 0)
                 .await
         })
         .await;
 
         match map_result {
-            Ok(Ok(result)) => Ok(result),
+            Ok(Ok((lines, metrics))) => {
+                let header = format!(
+                    "map: {} ({} files, {} lines total, depth={})",
+                    rel_path, metrics.file_count, metrics.total_lines, metrics.max_depth
+                );
+                let mut output = vec![header];
+                output.extend(lines);
+                let result = output.join("\n");
+                if result.len() > output_limit {
+                    Ok(result[..output_limit].to_string() + "\n... [truncated]")
+                } else {
+                    Ok(result)
+                }
+            }
             Ok(Err(e)) => Err(e),
             Err(_) => Err("Map operation timed out after 3 seconds".to_string()),
         }
     }
 
-    fn map_directory<'a>(
+    #[allow(clippy::type_complexity)]
+    #[allow(clippy::only_used_in_recursion)]
+    fn map_directory_with_metrics<'a>(
         &'a self,
         dir_path: &'a std::path::Path,
         max_depth: usize,
-        output_limit: usize,
+        _output_limit: usize,
         current_depth: usize,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>> + Send + 'a>>
-    {
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(Vec<String>, MapMetrics), String>> + Send + 'a,
+        >,
+    > {
         Box::pin(async move {
             use tokio::fs;
 
             if current_depth > max_depth {
-                return Ok(String::new());
+                return Ok((vec![], MapMetrics::default()));
             }
 
             const SKIP_DIRS: &[&str] = &[
@@ -393,6 +486,10 @@ impl WeavePatchServer {
             let dir_name = dir_path.file_name().and_then(|n| n.to_str()).unwrap_or(".");
 
             let mut lines: Vec<String> = Vec::new();
+            let mut metrics = MapMetrics {
+                max_depth: current_depth,
+                ..Default::default()
+            };
             let prefix = "  ".repeat(current_depth);
 
             let mut entries = match fs::read_dir(dir_path).await {
@@ -442,32 +539,36 @@ impl WeavePatchServer {
 
             for (_name, is_dir, path) in dir_entries {
                 if is_dir {
-                    let subresult = self
-                        .map_directory(&path, max_depth, output_limit, current_depth + 1)
+                    let (sub_lines, sub_metrics) = self
+                        .map_directory_with_metrics(
+                            &path,
+                            max_depth,
+                            _output_limit,
+                            current_depth + 1,
+                        )
                         .await?;
-                    if !subresult.is_empty() {
-                        lines.push(subresult);
-                    }
+                    lines.extend(sub_lines);
+                    metrics.file_count += sub_metrics.file_count;
+                    metrics.total_lines += sub_metrics.total_lines;
+                    metrics.max_depth = metrics.max_depth.max(sub_metrics.max_depth);
                 } else {
-                    let file_info = self.describe_file(&path, current_depth).await?;
+                    let (file_info, line_count) =
+                        self.describe_file_with_lines(&path, current_depth).await?;
                     lines.push(file_info);
+                    metrics.file_count += 1;
+                    metrics.total_lines += line_count;
                 }
             }
 
-            let result = lines.join("\n");
-            if result.len() > output_limit {
-                Ok(result[..output_limit].to_string() + "\n... [truncated]")
-            } else {
-                Ok(result)
-            }
+            Ok((lines, metrics))
         })
     }
 
-    async fn describe_file(
+    async fn describe_file_with_lines(
         &self,
         file_path: &std::path::Path,
         current_depth: usize,
-    ) -> Result<String, String> {
+    ) -> Result<(String, usize), String> {
         use tokio::fs;
 
         let file_name = file_path
@@ -477,9 +578,34 @@ impl WeavePatchServer {
 
         let prefix = "  ".repeat(current_depth + 1);
 
-        let content = match fs::read_to_string(file_path).await {
+        // Read bytes for binary detection
+        let bytes = match fs::read(file_path).await {
+            Ok(b) => b,
+            Err(_) => return Ok((format!("{}{}  [unreadable]", prefix, file_name), 0)),
+        };
+
+        // Check for null bytes in first 8KB (binary indicator)
+        const CHECK_SIZE: usize = 8192;
+        let check_len = std::cmp::min(bytes.len(), CHECK_SIZE);
+        let is_binary = bytes[..check_len].contains(&0);
+
+        if is_binary {
+            let size_kb = bytes.len() / 1024;
+            let size_display = if size_kb > 0 {
+                format!("{} KB", size_kb)
+            } else {
+                format!("{} B", bytes.len())
+            };
+            return Ok((
+                format!("{}{}  {} [binary]", prefix, file_name, size_display),
+                0,
+            ));
+        }
+
+        // Convert to string for text files
+        let content = match String::from_utf8(bytes) {
             Ok(c) => c,
-            Err(_) => return Ok(format!("{}{}  [binary]", prefix, file_name)),
+            Err(_) => return Ok((format!("{}{}  [decode error]", prefix, file_name), 0)),
         };
 
         let line_count = content.lines().count();
@@ -487,20 +613,29 @@ impl WeavePatchServer {
         if (1..=2).contains(&current_depth) {
             let func_ranges = extract_function_ranges(&content);
             if func_ranges.is_empty() {
-                Ok(format!("{}{}  {} LOC", prefix, file_name, line_count))
+                Ok((
+                    format!("{}{}  {} LOC [text]", prefix, file_name, line_count),
+                    line_count,
+                ))
             } else {
                 let func_list = func_ranges
                     .iter()
                     .map(|(name, start, end)| format!("{}[{}:{}]", name, start, end))
                     .collect::<Vec<_>>()
                     .join(", ");
-                Ok(format!(
-                    "{}{}  {} LOC  [{}]",
-                    prefix, file_name, line_count, func_list
+                Ok((
+                    format!(
+                        "{}{}  {} LOC [text]  [{}]",
+                        prefix, file_name, line_count, func_list
+                    ),
+                    line_count,
                 ))
             }
         } else {
-            Ok(format!("{}{}  {} LOC", prefix, file_name, line_count))
+            Ok((
+                format!("{}{}  {} LOC [text]", prefix, file_name, line_count),
+                line_count,
+            ))
         }
     }
 
@@ -686,6 +821,14 @@ fn find_function_end(lines: &[&str], start_idx: usize) -> usize {
     lines.len()
 }
 
+fn format_batch(batch_index: &Option<usize>, batch_total: &Option<usize>) -> String {
+    if let (Some(idx), Some(total)) = (batch_index, batch_total) {
+        format!(" [{}/{}]", idx, total)
+    } else {
+        String::new()
+    }
+}
+
 fn infer_language(path: &str) -> String {
     let ext = std::path::Path::new(path)
         .extension()
@@ -726,3 +869,4 @@ pub async fn run() -> anyhow::Result<()> {
     service.waiting().await?;
     Ok(())
 }
+use crate::applier::OpStatus;

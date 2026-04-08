@@ -287,6 +287,20 @@ Read operations execute first (safe/read-only), then write operations are applie
 
 - **Structured errors** — LLM-friendly diagnostics that show exactly where and why matching failed.
 
+### Operation Status
+
+Every operation returns a structured `OpStatus` enum instead of a string:
+
+| Status | Meaning | Example |
+|--------|---------|---------|
+| `ok` | Operation succeeded | File created/updated/deleted |
+| `skipped` | No-op, already in desired state | Delete non-existent file |
+| `recoverable_error` | Context match failed, may work with different hunks | Context not found |
+| `fatal_error` | File system issue blocks operation | File not found, permission denied |
+| `validation_warning` | Syntax/format issue (advisory, non-blocking) | rustfmt warning |
+
+**JSON consumers**: Status is now an enum, not a string. Old `"error"` status is split into `"recoverable_error"` or `"fatal_error"` based on error type.
+
 - **Advisory validation** — Syntax checks after every write, without blocking the patch.
 
   **Supported validators:**

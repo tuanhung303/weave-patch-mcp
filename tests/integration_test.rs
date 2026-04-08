@@ -32,7 +32,8 @@ fn test_hint_disambiguates_identical_code() {
     let ops = parse_patch(input).unwrap().ops;
     let result = weave_patch(ops, dir.path());
     assert_eq!(
-        result.operations[0].status, "ok",
+        result.operations[0].status,
+        OpStatus::Ok,
         "Hint should disambiguate to function_b: {}",
         result.operations[0].message
     );
@@ -81,7 +82,8 @@ fn test_py_nested_indentation_patch() {
     let ops = parse_patch(input).unwrap().ops;
     let result = weave_patch(ops, dir.path());
     assert_eq!(
-        result.operations[0].status, "ok",
+        result.operations[0].status,
+        OpStatus::Ok,
         "Nested indent patch should succeed: {}",
         result.operations[0].message
     );
@@ -133,7 +135,8 @@ fn test_crlf_line_endings_patch() {
     let ops = parse_patch(input).unwrap().ops;
     let result = weave_patch(ops, dir.path());
     assert_eq!(
-        result.operations[0].status, "ok",
+        result.operations[0].status,
+        OpStatus::Ok,
         "CRLF patch should succeed after normalization: {}",
         result.operations[0].message
     );
@@ -173,7 +176,8 @@ fn test_context_not_found_has_diagnostics() {
     let ops = parse_patch(input).unwrap().ops;
     let result = weave_patch(ops, dir.path());
     assert_eq!(
-        result.operations[0].status, "error",
+        result.operations[0].status,
+        OpStatus::RecoverableError,
         "Non-existent context should fail, got: {}",
         result.operations[0].message
     );
@@ -219,7 +223,8 @@ fn patch_empty_file_creation() {
     let result = weave_patch(ops, dir.path());
 
     assert_eq!(
-        result.operations[0].status, "ok",
+        result.operations[0].status,
+        OpStatus::Ok,
         "Empty file creation should succeed: {}",
         result.operations[0].message
     );
@@ -255,7 +260,8 @@ fn patch_unicode_content_preserved() {
     let result = weave_patch(ops, dir.path());
 
     assert_eq!(
-        result.operations[0].status, "ok",
+        result.operations[0].status,
+        OpStatus::Ok,
         "Unicode patch should succeed: {}",
         result.operations[0].message
     );
@@ -297,7 +303,8 @@ fn patch_very_long_lines_handled() {
     let result = weave_patch(ops, dir.path());
 
     assert_eq!(
-        result.operations[0].status, "ok",
+        result.operations[0].status,
+        OpStatus::Ok,
         "Long line patch should succeed: {}",
         result.operations[0].message
     );
@@ -400,7 +407,7 @@ fn patch_read_only_file_handling() {
 
     let content = fs::read_to_string(&path).unwrap();
 
-    if result.operations[0].status == "ok" {
+    if result.operations[0].status == OpStatus::Ok {
         // If it succeeded, verify the change was applied
         assert!(
             content.contains("new line") || content.contains("content"),
@@ -453,7 +460,10 @@ fn patch_multi_file_atomic_all_or_nothing() {
 
     // Entire patch should fail due to context mismatch on file2
     assert!(
-        result.operations.iter().any(|op| op.status == "error"),
+        result
+            .operations
+            .iter()
+            .any(|op| op.status == OpStatus::FatalError || op.status == OpStatus::RecoverableError),
         "Patch should have at least one error"
     );
 
@@ -519,9 +529,9 @@ fn test_unified_read_write_patch() {
     // Apply the patch
     let result = weave_patch(ops, dir.path());
     assert_eq!(result.operations.len(), 2);
-    assert_eq!(result.operations[0].status, "ok");
+    assert_eq!(result.operations[0].status, OpStatus::Ok);
     assert_eq!(result.operations[0].op_type, "read");
-    assert_eq!(result.operations[1].status, "ok");
+    assert_eq!(result.operations[0].status, OpStatus::Ok);
     assert_eq!(result.operations[1].op_type, "update");
 
     // Verify lib.rs was updated
@@ -563,7 +573,7 @@ fn test_mixed_operations_in_patch() {
 
     // All operations should succeed
     for op in &result.operations {
-        assert_eq!(op.status, "ok", "Operation failed: {:?}", op);
+        assert_eq!(op.status, OpStatus::Ok, "Operation failed: {:?}", op);
     }
 
     // Verify results
@@ -608,7 +618,8 @@ fn test_word_boundary_hint_matching() {
     let ops = parse_patch(input).unwrap().ops;
     let result = weave_patch(ops, dir.path());
     assert_eq!(
-        result.operations[0].status, "ok",
+        result.operations[0].status,
+        OpStatus::Ok,
         "Word-boundary hint should match exactly 'def foo()': {}",
         result.operations[0].message
     );
@@ -652,7 +663,8 @@ fn test_word_boundary_hint_matching() {
     let ops2 = parse_patch(input2).unwrap().ops;
     let result2 = weave_patch(ops2, dir.path());
     assert_eq!(
-        result2.operations[0].status, "ok",
+        result2.operations[0].status,
+        OpStatus::Ok,
         "Word-boundary hint should match 'def foo_bar()': {}",
         result2.operations[0].message
     );
@@ -701,9 +713,11 @@ fn test_parallel_patch_multiple_files() {
     // All operations should succeed
     for (i, op) in result.operations.iter().enumerate() {
         assert_eq!(
-            op.status, "ok",
+            op.status,
+            OpStatus::Ok,
             "Operation {} should succeed: {}",
-            i, op.message
+            i,
+            op.message
         );
     }
 
@@ -739,7 +753,10 @@ fn test_conflict_add_update_same_path() {
     let result = weave_patch(ops, dir.path());
 
     // Should have an error due to conflict
-    let has_error = result.operations.iter().any(|op| op.status == "error");
+    let has_error = result
+        .operations
+        .iter()
+        .any(|op| op.status == OpStatus::FatalError || op.status == OpStatus::RecoverableError);
     assert!(has_error, "Should detect Add+Update conflict");
 
     // At least one operation should mention conflict
@@ -779,7 +796,7 @@ fn test_threshold_default_rejects_low_similarity() {
 
     // Should fail because similarity is below 97%
     assert!(
-        result.operations[0].status == "error",
+        result.operations[0].status == OpStatus::RecoverableError,
         "Should reject low-similarity match with 0.97 threshold"
     );
 }
@@ -817,7 +834,7 @@ fn test_threshold_low_accepts_medium_similarity() {
 
     // With threshold 0.80, fuzzy matching should accept ~93% similarity
     assert!(
-        result.operations[0].status == "ok",
+        result.operations[0].status == OpStatus::Ok,
         "Expected patch to succeed with threshold 0.80"
     );
 }
@@ -852,7 +869,7 @@ fn test_threshold_1_0_requires_exact() {
     // With threshold 1.0, fuzzy match requires 100% similarity
     // One char difference makes similarity < 100%, so fuzzy match fails
     assert!(
-        result.operations[0].status == "error",
+        result.operations[0].status == OpStatus::RecoverableError,
         "Threshold 1.0 should require 100% similarity for fuzzy match"
     );
 }
@@ -898,7 +915,7 @@ fn test_llm_error_context_not_found() {
     let result = weave_patch(ops, dir.path());
 
     // Should error
-    assert!(result.operations[0].status == "error");
+    assert!(result.operations[0].status == OpStatus::RecoverableError);
 
     // Error message should be structured
     let msg = &result.operations[0].message;
@@ -914,7 +931,7 @@ fn test_llm_error_file_not_found() {
     let output = err.to_json();
 
     assert_eq!(output.file, "missing.txt");
-    assert_eq!(output.suggested_action, "create_file_first");
+    assert_eq!(output.suggested_action, "create_target_file_before_patch");
     assert!(output.recovery_hint.contains("does not exist"));
 }
 
@@ -932,7 +949,7 @@ fn test_llm_error_ambiguous_context() {
     let output = err.to_json();
 
     assert_eq!(output.file, "test.rs");
-    assert_eq!(output.suggested_action, "add_unique_context");
+    assert_eq!(output.suggested_action, "add_disambiguating_context_lines");
     assert!(output.recovery_hint.contains("3 matches"));
 }
 
@@ -944,7 +961,7 @@ fn test_llm_error_parse() {
     let err = PatchError::Parse("Invalid patch format".to_string());
     let output = err.to_json();
 
-    assert_eq!(output.suggested_action, "fix_patch_syntax");
+    assert_eq!(output.suggested_action, "correct_syntax_in_patch_block");
     assert!(output.recovery_hint.contains("Patch syntax error"));
 }
 
@@ -968,7 +985,10 @@ fn test_llm_error_file_already_exists() {
     let err = PatchError::FileAlreadyExists("existing.txt".to_string());
     let output = err.to_json();
 
-    assert_eq!(output.suggested_action, "use_update_not_add");
+    assert_eq!(
+        output.suggested_action,
+        "use_update_operation_for_existing_file"
+    );
     assert!(output.recovery_hint.contains("already exists"));
 }
 /// Test: Threshold 0.0 accepts any valid fuzzy match (clamped minimum)
@@ -998,7 +1018,7 @@ fn test_threshold_0_0_accepts_any_similarity() {
     // With threshold 0.0 (clamped), fuzzy matching accepts any similarity > 0
     let result = weave_patch_with_threshold(ops, dir.path(), Some(0.0));
     assert!(
-        result.operations[0].status == "ok",
+        result.operations[0].status == OpStatus::Ok,
         "Expected patch to succeed with threshold 0.0 (accepts any match)"
     );
 }
@@ -1029,7 +1049,7 @@ fn test_negative_threshold_clamped_to_0() {
     // Negative threshold should be clamped to 0.0 and behave the same as 0.0
     let result = weave_patch_with_threshold(ops, dir.path(), Some(-0.5));
     assert!(
-        result.operations[0].status == "ok",
+        result.operations[0].status == OpStatus::Ok,
         "Expected patch to succeed with negative threshold (clamped to 0.0)"
     );
 }
@@ -1061,7 +1081,8 @@ fn test_threshold_above_1_clamped_to_1() {
     // One char difference makes similarity < 100%, so fuzzy match fails
     let result = weave_patch_with_threshold(ops, dir.path(), Some(2.0));
     assert!(
-        result.operations[0].status == "error",
+        result.operations[0].status == OpStatus::RecoverableError,
         "Expected patch to fail with threshold 2.0 (clamped to 1.0, requires 100% similarity)"
     );
 }
+use weave_patch_mcp::applier::OpStatus;
