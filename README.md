@@ -34,6 +34,13 @@ Every multi-file edit is a gamble. One call fails, and now the agent is debuggin
 
 ### Recommended: Disable Traditional Tools
 
+This MCP tool replaces traditional file operations with unified patch syntax:
+- `Read(*)` → `patch__exec` read operations
+- `Edit(*)` → `patch__exec` update operations  
+- `Write(*)` → `patch__exec` create operations
+
+Configure your MCP client to disable these tools when using patch__exec to prevent conflicts and ensure atomic operations.
+
 For best results, deny Edit/Write in MCP client settings so the LLM agent always uses weave-patch:
 
 Add to the client's deny list:
