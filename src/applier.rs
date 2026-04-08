@@ -404,7 +404,7 @@ fn prepare_op(
                     if !meta.is_file() {
                         return make_op(&path, "read", "error", "Not a regular file");
                     }
-                    make_op(&path, "read", "ok", "File read successfully")
+                    make_op(&path, "read", "ok", &format!("read: {} (ok)", path))
                 }
                 Err(e) => make_op(&path, "read", "error", &e.to_string()),
             }
@@ -421,7 +421,7 @@ fn prepare_op(
                 if !full_path.is_dir() {
                     return make_op(&path, "map", "error", "Path is not a directory");
                 }
-                make_op(&path, "map", "ok", "")
+                make_op(&path, "map", "ok", &format!("map: {} (ok)", path))
             }
             Err(e) => make_op(&path, "map", "error", &e.to_string()),
         },
@@ -478,7 +478,7 @@ fn stage_add(
     tx.stage(shadow, path.to_path_buf());
 
     Ok(StageAddResult {
-        message: "File created".to_string(),
+        message: format!("add: {} ({} lines)", path.display(), line_count),
         warnings,
         diff,
         line_changes: Some((0, line_count)),
@@ -514,7 +514,7 @@ fn stage_delete(
     tx.queue_deletion(path.to_path_buf());
 
     Ok(StageDeleteResult {
-        message: format!("removed {line_count} lines"),
+        message: format!("delete: {} (was {} lines)", display_path, line_count),
         line_changes: Some((line_count, 0)),
     })
 }
@@ -578,7 +578,10 @@ fn stage_update(
     let warnings = crate::validator::validate_file(&shadow, path);
     tx.stage(shadow.clone(), path.to_path_buf());
 
-    let message = format!("{original_line_count} → {new_line_count} lines");
+    let message = format!(
+        "update: {} ({}→{} lines)",
+        display_path, original_line_count, new_line_count
+    );
 
     Ok(StageUpdateResult {
         shadow_path: shadow,
@@ -1234,7 +1237,8 @@ mod tests {
         let result = weave_patch(ops, dir.path());
         assert_eq!(result.operations[0].status, "ok");
         assert_eq!(result.operations[0].line_changes, Some((4, 0)));
-        assert!(result.operations[0].message.contains("removed 4 lines"));
+        assert!(result.operations[0].message.contains("delete:"));
+        assert!(result.operations[0].message.contains("(was 4 lines)"));
     }
 
     #[test]
@@ -1394,7 +1398,7 @@ mod tests {
         let result = weave_patch(ops, dir.path());
         assert_eq!(result.operations[0].status, "error");
         assert!(
-            result.operations[0].message.contains("Context not found")
+            result.operations[0].message.contains("context not found")
                 || result.operations[0].message.contains("locate hunk")
         );
     }
@@ -1908,12 +1912,7 @@ mod tests {
         }];
         let result = weave_patch(ops, dir.path());
         assert_eq!(result.operations[0].status, "error");
-        // The error message should contain "Context not found"
-        assert!(
-            result.operations[0].message.contains("Context not found"),
-            "got: {}",
-            result.operations[0].message
-        );
+        assert!(result.operations[0].message.contains("context not found:"));
     }
 
     #[test]

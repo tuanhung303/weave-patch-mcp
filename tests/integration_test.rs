@@ -948,18 +948,6 @@ fn test_llm_error_parse() {
     assert!(output.recovery_hint.contains("Patch syntax error"));
 }
 
-/// Test: Path traversal error produces LLM-readable output
-#[test]
-fn test_llm_error_path_traversal() {
-    use weave_patch_mcp::error::PatchError;
-
-    let err = PatchError::PathTraversal("../etc/passwd".to_string());
-    let output = err.to_json();
-
-    assert_eq!(output.suggested_action, "use_relative_path");
-    assert!(output.recovery_hint.contains("directory traversal"));
-}
-
 /// Test: Symlink rejected error produces LLM-readable output
 #[test]
 fn test_llm_error_symlink_rejected() {

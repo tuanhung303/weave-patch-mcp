@@ -1,7 +1,20 @@
 # weave-patch-mcp
 
-**v2.0** — Production-ready MCP server for structured file patching using compact syntax.  
-One tool, five operations. Create, read, map, update, and delete files in a single atomic call.
+[![version](https://img.shields.io/badge/version-0.0.3-blue)](https://www.npmjs.com/package/mcp-weave-patch) [![license](https://img.shields.io/badge/license-MIT-green)](https://opensource.org/licenses/MIT) [![platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)](#supported-platforms)
+
+**One tool. Five operations. Zero intermediate states.**
+
+Your code drifted? We still find it. Your refactor touched 47 files? All-or-nothing writes. No half-applied states left behind.
+
+---
+
+## The Problem
+
+You've been there: edit one file, break three others. Context drift makes your line numbers stale. Token limits force you into partial commits. Your LLM leaves half-finished refactors across your repo, and you're stuck manually piecing it back together.
+
+**Blind spots surface before you ship.**
+
+Every multi-file edit is a gamble. One call fails, and now you're debugging intermediate state. Meanwhile, the clock's ticking on your context window.
 
 ## Why This Over Edit/Write?
 
@@ -15,6 +28,8 @@ One tool, five operations. Create, read, map, update, and delete files in a sing
 | **Scale** | Painful at 5+ files | Handles 100+ files per call |
 | **Error recovery** | Manual retry | Fuzzy matching + structured diagnostics |
 
+**Atomic patches that survive context drift.** Scale from 1 file to 100+. Same call. Same guarantees.
+
 ### Recommended: Disable Traditional Tools
 
 For best results, deny Edit/Write in your MCP client settings so the model always uses weave-patch:
@@ -24,7 +39,7 @@ Add to your client's deny list:
 ["Edit(*)", "Write(*)"]
 ```
 
-This eliminates context pollution from unused tool descriptions and forces consistent patch-based editing.
+**Stop burning tokens on unused tool descriptions.**
 
 ## Installation
 
@@ -32,7 +47,7 @@ This eliminates context pollution from unused tool descriptions and forces consi
 npx -y mcp-weave-patch
 ```
 
-No install needed — npx downloads the latest release automatically. The binary is cached at `~/.weave-patch/bin/` and version-checked on every launch (auto-reinstalls if stale).
+No install required. npx fetches the latest release, caches it at `~/.weave-patch/bin/`, and auto-reinstalls on version changes.
 
 ### Supported Platforms
 
@@ -96,6 +111,8 @@ All patches are wrapped in `=== begin` / `=== end` markers.
 
 ### 1. Read a file
 
+**Extract just what you need.** Symbol extraction pulls functions, classes, and structs without reading entire files — saving tokens and surfacing relevant context.
+
 ```
 === begin
 read src/main.rs
@@ -116,7 +133,6 @@ read config.py offset=10 limit=50
 === end
 ```
 
-
 **Read multiple files** (batch read):
 ```
 === begin
@@ -128,7 +144,7 @@ read src/config.rs
 
 ### 2. Map a directory
 
-Scan directory structure recursively. Returns files with sizes, line counts, and function signatures (`name: start:end`) at depth 1-3. Skips `node_modules`, `.git`, `target`, binaries.
+**Know your repo's shape at a glance.** Returns files, sizes, line counts, and function signatures — everything you need to navigate unfamiliar code.
 
 ```
 === begin
@@ -140,6 +156,8 @@ Defaults: `depth=3`, `limit=6000` chars.
 
 ### 3. Add a file
 
+**Every file starts with one call.** No switching tools, no context pollution.
+
 ```
 === begin
 create src/hello.rs
@@ -148,6 +166,12 @@ create src/hello.rs
 ```
 
 ### 4. Update a file
+
+**Your code drifted? We still find it.** Three-phase matching (exact → whitespace-normalized → fuzzy at 85%+) means context drift won't break your patch.
+
+**Not "match failed" — "closest match at line 42 (87% similar)."**
+
+Structured diagnostics give you the top-3 closest matches with line numbers and similarity scores. Self-correct without re-reading the entire file.
 
 Context lines (space-prefixed) anchor the edit. `-` removes, `+` adds.
 
@@ -209,12 +233,13 @@ update src/db.rs
 
 ### 5. Delete a file
 
+**Clean removal.** One call, file gone. No orphaned references left behind.
+
 ```
 === begin
 delete src/deprecated.rs
 === end
 ```
-
 
 **Delete multiple files** (batch delete):
 ```
@@ -247,11 +272,13 @@ Read operations execute first (safe/read-only), then write operations are applie
 
 ## Key Concepts
 
-- **Context matching**: 3-phase pipeline — exact match → whitespace-normalized → fuzzy (≥85% similarity). Short patterns (< 3 lines) use exact matching only to prevent false positives.
-- **@@ hints**: Optional substring matched against file lines to disambiguate when context appears in multiple locations. Use a function name, class name, or any nearby unique text.
-- **Atomicity**: Multi-file patches use two-phase commit with shadow files. If any operation fails, all changes are rolled back — no partial writes.
-- **Structured errors**: When context matching fails, error responses include the top-3 closest matches with similarity scores and line numbers, enabling LLMs to self-correct.
-- **Advisory validation**: After patching, files are validated against language-specific formatters. Issues appear as warnings without blocking the patch.
+- **Atomicity** — All-or-nothing writes. No half-applied refactors. Multi-file patches use two-phase commit with shadow files. If any operation fails, everything rolls back.
+
+- **Fuzzy matching** — Your code drifted? We still find it. Three-phase pipeline matches context even after edits.
+
+- **Structured errors** — LLM-friendly diagnostics that show you exactly where and why matching failed.
+
+- **Advisory validation** — Syntax checks after every write, without blocking your patch.
 
   **Supported validators:**
 
@@ -266,9 +293,22 @@ Read operations execute first (safe/read-only), then write operations are applie
   | Terraform  | `terraform fmt`              |
 
 - **Limits**: 2MB total output for reads, 512KB per file.
-- **Security**: No path traversal (`../`), no symlinks, no absolute paths.
+- **Security**: Symlinks rejected. Path traversal allowed (tool can access any path with user permissions).
+
+## Use-Case Matrix
+
+| Scenario | Operations | Why It Wins |
+|----------|-----------|-------------|
+| **Multi-file refactor** | `update` (batch) | One call, 47 files. All-or-nothing. |
+| **Exploring unfamiliar code** | `map` + `read symbols=` | Token-efficient symbol extraction |
+| **Fixing tests across files** | `read` + `update` + `delete` | Combined read/write in one atomic call |
+| **Deleting deprecated paths** | `delete` (batch) | Clean removal, no partial states |
+| **Renaming during refactor** | `update` + `move_to` | Rename and edit atomically |
+| **Adding new modules** | `create` (batch) | Create multiple files without tool-switching |
 
 ## Architecture
+
+**One tool. One parameter. Everything else is handled.**
 
 ```
 ┌─────────────┐     ┌──────────┐     ┌──────────┐
@@ -281,8 +321,10 @@ Read operations execute first (safe/read-only), then write operations are applie
 
 **CI/CD Pipeline** (triggered on push to `main`):
 
+**150 tests. Comprehensive test coverage. If it fails, nothing ships.**
+
 ```
-test (fmt + clippy + 125 tests)
+test (fmt + clippy + 150 tests)
   ↓
 version-bump (auto-increment patch)
   ↓
@@ -311,7 +353,7 @@ Run tests:
 cargo test
 ```
 
-### Test Coverage (125 tests)
+### Test Coverage (150 tests)
 
 | Suite | Coverage |
 |---|---|
