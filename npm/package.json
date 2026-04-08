@@ -1,6 +1,6 @@
 {
   "name": "mcp-weave-patch",
-  "version": "0.0.6",
+  "version": "0.0.9",
   "description": "MCP server for structured file patching using compact syntax. Create, update, and delete files in one atomic operation.",
   "license": "MIT",
   "repository": {
