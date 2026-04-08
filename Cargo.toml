@@ -1,0 +1,34 @@
+[package]
+name = "weave-patch-mcp"
+version = "0.0.5"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+dirs = "5"
+rmcp = { version = "1.2.0", features = ["server", "transport-io", "macros", "schemars"] }
+schemars = "1"
+similar = { version = "2", default-features = false, features = ["text"] }
+glob = "0.3"
+regex = "1"
+rayon = "1.10"
+uuid = { version = "1", features = ["v4"] }
+parking_lot = "0.12"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lib]
+name = "weave_patch_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "weave-patch-mcp"
+path = "src/main.rs"
