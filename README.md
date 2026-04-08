@@ -4,17 +4,17 @@
 
 **One tool. Five operations. Zero intermediate states.**
 
-Your code drifted? We still find it. Your refactor touched 47 files? All-or-nothing writes. No half-applied states left behind.
+Code drifted? We still find it. Refactor touched 47 files? All-or-nothing writes. No half-applied states left behind.
 
 ---
 
 ## The Problem
 
-You've been there: edit one file, break three others. Context drift makes your line numbers stale. Token limits force you into partial commits. Your LLM leaves half-finished refactors across your repo, and you're stuck manually piecing it back together.
+Context drift makes line numbers stale. Token limits force LLM agents into partial commits. Half-finished refactors scatter across repos when agents can't apply atomic changes.
 
-**Blind spots surface before you ship.**
+**Blind spots surface before the agent ships.**
 
-Every multi-file edit is a gamble. One call fails, and now you're debugging intermediate state. Meanwhile, the clock's ticking on your context window.
+Every multi-file edit is a gamble. One call fails, and now the agent is debugging intermediate state. Meanwhile, the context window shrinks.
 
 ## Why This Over Edit/Write?
 
@@ -32,9 +32,9 @@ Every multi-file edit is a gamble. One call fails, and now you're debugging inte
 
 ### Recommended: Disable Traditional Tools
 
-For best results, deny Edit/Write in your MCP client settings so the model always uses weave-patch:
+For best results, deny Edit/Write in MCP client settings so the LLM agent always uses weave-patch:
 
-Add to your client's deny list:
+Add to the client's deny list:
 ```json
 ["Edit(*)", "Write(*)"]
 ```
@@ -111,7 +111,7 @@ All patches are wrapped in `=== begin` / `=== end` markers.
 
 ### 1. Read a file
 
-**Extract just what you need.** Symbol extraction pulls functions, classes, and structs without reading entire files — saving tokens and surfacing relevant context.
+**Extract just what you need.** Symbol extraction pulls functions, classes, and structs without reading entire files — token-efficient and surfacing relevant context.
 
 ```
 === begin
@@ -144,7 +144,7 @@ read src/config.rs
 
 ### 2. Map a directory
 
-**Know your repo's shape at a glance.** Returns files, sizes, line counts, and function signatures — everything you need to navigate unfamiliar code.
+**Know the repo's shape at a glance.** Returns files, sizes, line counts, and function signatures — everything needed to navigate unfamiliar code.
 
 ```
 === begin
@@ -167,11 +167,11 @@ create src/hello.rs
 
 ### 4. Update a file
 
-**Your code drifted? We still find it.** Three-phase matching (exact → whitespace-normalized → fuzzy at 85%+) means context drift won't break your patch.
+**Code drifted? We still find it.** Three-phase matching (exact → whitespace-normalized → fuzzy at 85%+) means context drift won't break the patch.
 
 **Not "match failed" — "closest match at line 42 (87% similar)."**
 
-Structured diagnostics give you the top-3 closest matches with line numbers and similarity scores. Self-correct without re-reading the entire file.
+Structured diagnostics show the top-3 closest matches with line numbers and similarity scores. Self-correct without re-reading the entire file.
 
 Context lines (space-prefixed) anchor the edit. `-` removes, `+` adds.
 
@@ -274,7 +274,7 @@ Read operations execute first (safe/read-only), then write operations are applie
 
 - **Atomicity** — All-or-nothing writes. No half-applied refactors. Multi-file patches use two-phase commit with shadow files. If any operation fails, everything rolls back.
 
-- **Fuzzy matching** — Your code drifted? We still find it. Three-phase pipeline matches context even after edits.
+- **Fuzzy matching** — Code drifted? We still find it. Three-phase pipeline matches context even after edits.
 
 - **Structured errors** — LLM-friendly diagnostics that show you exactly where and why matching failed.
 
@@ -311,12 +311,11 @@ Read operations execute first (safe/read-only), then write operations are applie
 **One tool. One parameter. Everything else is handled.**
 
 ```
-┌─────────────┐     ┌──────────┐     ┌──────────┐
-│  LLM Client │────▶│ MCP Server│────▶│ Filesystem│
-│  (Qwen,     │     │ patch__   │     │ (reads,   │
-│  Claude,    │◀────│ exec      │◀────│ writes)   │
-│  Gemini)    │     └──────────┘     └──────────┘
-└─────────────┘
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│  LLM Client  │────▶│  MCP Server  │────▶│  Filesystem  │
+│  (Claude,    │     │ patch__exec  │     │ (reads,      │
+│  Qwen, etc.) │◀────│              │◀────│ writes)      │
+└──────────────┘     └──────────────┘     └──────────────┘
 ```
 
 **CI/CD Pipeline** (triggered on push to `main`):
