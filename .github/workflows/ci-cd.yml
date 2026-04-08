@@ -1,0 +1,203 @@
+name: CI/CD
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@0c366fd6a839edf440554fa01a7085ccba70ac98 # v4.x
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.x
+      - run: cargo fmt --check
+      - run: cargo clippy -- -D warnings
+      - run: cargo test
+
+  version-bump:
+    name: Bump version & tag
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && !contains(github.event.head_commit.message, '[skip ci]')
+    permissions:
+      contents: write
+    outputs:
+      new_version: ${{ steps.bump.outputs.new_version }}
+      tag: ${{ steps.bump.outputs.tag }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@0c366fd6a839edf440554fa01a7085ccba70ac98 # v4.x
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_TOKEN }}
+
+      - name: Configure git user
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Bump patch version
+        id: bump
+        run: |
+          # Read current version from Cargo.toml
+          CURRENT=$(grep '^version = ' Cargo.toml | head -n 1 | sed 's/version = "\(.*\)"/\1/')
+          echo "Current version: $CURRENT"
+
+          # Split into parts and increment patch
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+          NEW_PATCH=$((PATCH + 1))
+          NEW_VERSION="${MAJOR}.${MINOR}.${NEW_PATCH}"
+          echo "New version: $NEW_VERSION"
+
+          # Write back to Cargo.toml (first occurrence of version = "...")
+          sed -i "0,/^version = \"${CURRENT}\"/s//version = \"${NEW_VERSION}\"/" Cargo.toml
+
+          # Sync npm/package.json version
+          sed -i "s/\"version\": \".*\"/\"version\": \"${NEW_VERSION}\"/" npm/package.json
+
+          # Bump embedded version in tool description (server.rs)
+          sed -i "s/Version: ${CURRENT}/Version: ${NEW_VERSION}/g" src/server.rs
+
+          echo "new_version=${NEW_VERSION}" >> $GITHUB_OUTPUT
+          echo "tag=v${NEW_VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Commit version bump
+        run: |
+          git add Cargo.toml npm/package.json src/server.rs
+          git commit -m "chore: bump version to ${{ steps.bump.outputs.new_version }} [skip ci]"
+
+      - name: Push commit and tag
+        run: |
+          git tag ${{ steps.bump.outputs.tag }}
+          git push origin main
+          git push origin ${{ steps.bump.outputs.tag }}
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: version-bump
+    if: always() && needs.version-bump.result == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository (at new tag)
+        uses: actions/checkout@0c366fd6a839edf440554fa01a7085ccba70ac98 # v4.x
+        with:
+          ref: ${{ needs.version-bump.outputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.x
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Ad-hoc sign macOS binary
+        if: runner.os == 'macOS'
+        run: |
+          codesign --force --sign - --timestamp=none "target/${{ matrix.target }}/release/weave-patch-mcp"
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          if [ -f "target/${{ matrix.target }}/release/weave-patch-mcp" ]; then
+            cd "target/${{ matrix.target }}/release"
+          else
+            cd "target/release"
+          fi
+          tar czf ../../../weave-patch-mcp-${{ needs.version-bump.outputs.tag }}-${{ matrix.target }}.tar.gz weave-patch-mcp
+          cd ../../../
+          sha256sum weave-patch-mcp-${{ needs.version-bump.outputs.tag }}-${{ matrix.target }}.tar.gz > weave-patch-mcp-${{ needs.version-bump.outputs.tag }}-${{ matrix.target }}.tar.gz.sha256
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          if [ -f "target/${{ matrix.target }}/release/weave-patch-mcp.exe" ]; then
+            cd "target/${{ matrix.target }}/release"
+          else
+            cd "target/release"
+          fi
+          7z a ../../../weave-patch-mcp-${{ needs.version-bump.outputs.tag }}-${{ matrix.target }}.zip weave-patch-mcp.exe
+          cd ../../../
+          sha256sum weave-patch-mcp-${{ needs.version-bump.outputs.tag }}-${{ matrix.target }}.zip > weave-patch-mcp-${{ needs.version-bump.outputs.tag }}-${{ matrix.target }}.zip.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v4.x
+        with:
+          name: binary-${{ matrix.target }}
+          path: weave-patch-mcp-${{ needs.version-bump.outputs.tag }}-*
+
+  release:
+    name: Create GitHub Release
+    needs: [version-bump, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@0c366fd6a839edf440554fa01a7085ccba70ac98 # v4.x
+        with:
+          ref: ${{ needs.version-bump.outputs.tag }}
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@484a0b528fb4d7bd804637ccb632e47a0e638317 # v4.x
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.6.1
+        with:
+          tag_name: ${{ needs.version-bump.outputs.tag }}
+          files: artifacts/*
+          generate_release_notes: true
+
+  publish-npm:
+    name: Publish to npm
+    needs: [version-bump, release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@0c366fd6a839edf440554fa01a7085ccba70ac98 # v4.x
+        with:
+          ref: ${{ needs.version-bump.outputs.tag }}
+
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v4.x
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Publish to npm
+        working-directory: npm
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

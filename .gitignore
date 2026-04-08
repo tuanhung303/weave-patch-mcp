@@ -1,0 +1,7 @@
+/target
+
+# npm wrapper
+npm/node_modules/
+npm/bin/weave-patch-mcp
+npm/bin/weave-patch-mcp.exe
+npm/*.tgz
