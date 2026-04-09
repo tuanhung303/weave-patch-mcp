@@ -4,9 +4,40 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use rayon::prelude::*;
 
-use crate::error::{ClosestMatch, ContextNotFoundData, PatchError};
+use crate::error::{ClosestMatch, ContextNotFoundData, FileNotFoundData, PatchError};
 use crate::parser::{DiffLine, FileOp, Hunk};
 use similar::TextDiff;
+
+/// How a path was resolved during file operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathSource {
+    /// Path was resolved relative to base_dir
+    Relative,
+    /// Path was absolute
+    Absolute,
+    /// Path had home directory (~) expanded
+    HomeExpanded,
+}
+
+impl std::fmt::Display for PathSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PathSource::Relative => write!(f, "relative"),
+            PathSource::Absolute => write!(f, "absolute"),
+            PathSource::HomeExpanded => write!(f, "home_expanded"),
+        }
+    }
+}
+
+/// The result of path resolution, containing the resolved path and its source.
+#[derive(Debug, Clone)]
+pub struct ResolvedPath {
+    /// The fully resolved, absolute path
+    pub full_path: PathBuf,
+    /// How the path was resolved (relative, absolute, or home-expanded)
+    pub source: PathSource,
+}
 
 /// Default fuzzy matching threshold (97% similarity required).
 /// Higher threshold reduces false positives in context matching.
@@ -50,6 +81,8 @@ pub struct OpResult {
     pub batch_index: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch_total: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_source: Option<PathSource>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -81,6 +114,7 @@ fn make_op(
         line_changes: None,
         match_info: None,
         llm_error: None,
+        path_source: None,
         batch_index: batch.map(|(idx, _)| idx),
         batch_total: batch.map(|(_, total)| total),
     }
@@ -553,10 +587,134 @@ pub fn check_symlink(path: &Path, display_path: &str) -> Result<(), PatchError> 
 }
 
 pub fn validate_path(base_dir: &Path, rel_path: &str) -> Result<PathBuf, PatchError> {
-    // Security note: Path sandbox removed per user request.
-    // Symlink protection is still enforced in check_symlink().
-    // This allows patches to access any path the user has permission for.
-    Ok(base_dir.join(rel_path))
+    let resolved = resolve_path(base_dir, rel_path);
+    Ok(resolved.full_path)
+}
+
+/// Resolve a path and track its source type.
+///
+/// Handles three cases:
+/// 1. Absolute paths (e.g., "/tmp/file.txt") -> used directly
+/// 2. Home-relative paths (e.g., "~/config/settings.json") -> expanded
+/// 3. Relative paths (e.g., "src/main.rs") -> joined with base_dir
+pub fn resolve_path(base_dir: &Path, path: &str) -> ResolvedPath {
+    // Case 1: Absolute path (starts with / on Unix, or drive letter on Windows)
+    let path_buf = PathBuf::from(path);
+    if path_buf.is_absolute() {
+        return ResolvedPath {
+            full_path: path_buf,
+            source: PathSource::Absolute,
+        };
+    }
+
+    // Case 2: Home directory expansion (starts with ~)
+    if let Some(expanded) = expand_home(path) {
+        return ResolvedPath {
+            full_path: expanded,
+            source: PathSource::HomeExpanded,
+        };
+    }
+
+    // Case 3: Relative path
+    ResolvedPath {
+        full_path: base_dir.join(path),
+        source: PathSource::Relative,
+    }
+}
+
+/// Expand home directory (~) in a path.
+/// Returns Some(expanded_path) if the path starts with ~, None otherwise.
+pub fn expand_home(path: &str) -> Option<PathBuf> {
+    if !path.starts_with('~') {
+        return None;
+    }
+
+    let expanded = shellexpand::tilde(path);
+    Some(PathBuf::from(expanded.as_ref()))
+}
+
+/// Calculate the Levenshtein distance between two strings.
+/// Returns the minimum number of single-character edits (insertions, deletions, substitutions)
+/// required to change one string into the other.
+pub fn levenshtein_distance(a: &str, b: &str) -> usize {
+    let a_len = a.chars().count();
+    let b_len = b.chars().count();
+
+    if a_len == 0 {
+        return b_len;
+    }
+    if b_len == 0 {
+        return a_len;
+    }
+
+    let mut matrix = vec![vec![0; b_len + 1]; a_len + 1];
+
+    // Initialize first column
+    for (i, row) in matrix.iter_mut().enumerate() {
+        row[0] = i;
+    }
+
+    // Initialize first row
+    for (j, cell) in matrix[0].iter_mut().enumerate() {
+        *cell = j;
+    }
+
+    // Fill in the rest of the matrix
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+
+    for i in 1..=a_len {
+        for j in 1..=b_len {
+            let cost = if a_chars[i - 1] == b_chars[j - 1] {
+                0
+            } else {
+                1
+            };
+            matrix[i][j] = std::cmp::min(
+                std::cmp::min(
+                    matrix[i - 1][j] + 1, // deletion
+                    matrix[i][j - 1] + 1, // insertion
+                ),
+                matrix[i - 1][j - 1] + cost, // substitution
+            );
+        }
+    }
+
+    matrix[a_len][b_len]
+}
+
+/// Find files in a directory with names similar to the target.
+/// Uses Levenshtein distance to measure similarity.
+/// Returns a vector of (path, distance) pairs sorted by distance.
+pub fn find_similar_files(dir: &Path, target: &str, max_distance: usize) -> Vec<(PathBuf, usize)> {
+    let mut results = Vec::new();
+
+    if !dir.exists() || !dir.is_dir() {
+        return results;
+    }
+
+    let target_path = PathBuf::from(target);
+    let target_name = target_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(target);
+
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file()
+                && let Some(name) = path.file_name().and_then(|n| n.to_str())
+            {
+                let distance = levenshtein_distance(target_name, name);
+                if distance <= max_distance {
+                    results.push((path, distance));
+                }
+            }
+        }
+    }
+
+    results.sort_by_key(|(_, d)| *d);
+    results
 }
 
 /// Result from stage_add
@@ -609,7 +767,12 @@ fn stage_delete(
     tx: &PatchTransaction,
 ) -> Result<StageDeleteResult, PatchError> {
     if !path.exists() {
-        return Err(PatchError::FileNotFound(display_path.to_string()));
+        return Err(PatchError::FileNotFound(FileNotFoundData {
+            path: display_path.to_string(),
+            resolved_as: PathSource::Relative,
+            suggestions: Vec::new(),
+            tried_paths: vec![path.display().to_string()],
+        }));
     }
     // Reject symlinks
     let meta = path.symlink_metadata()?;
@@ -649,7 +812,12 @@ fn stage_update(
     threshold: Option<f32>,
 ) -> Result<StageUpdateResult, PatchError> {
     if !path.exists() {
-        return Err(PatchError::FileNotFound(display_path.to_string()));
+        return Err(PatchError::FileNotFound(FileNotFoundData {
+            path: display_path.to_string(),
+            resolved_as: PathSource::Relative,
+            suggestions: Vec::new(),
+            tried_paths: vec![path.display().to_string()],
+        }));
     }
     // Reject symlinks
     let meta = path.symlink_metadata()?;
@@ -2259,6 +2427,150 @@ echo hello
         );
         // Cleanup
         let _ = fs::remove_file(&sibling_file);
+    }
+
+    // ============================================
+    // Tests for path resolution helper functions
+    // ============================================
+
+    #[test]
+    fn test_expand_home_with_tilde_path() {
+        // Test that ~/file.txt expands correctly
+        let result = expand_home("~/file.txt");
+        assert!(result.is_some());
+        let expanded = result.unwrap();
+        assert!(expanded.is_absolute());
+        assert!(expanded.ends_with("file.txt"));
+    }
+
+    #[test]
+    fn test_expand_home_just_tilde() {
+        // Test that ~ (just tilde) expands to home directory
+        let result = expand_home("~");
+        assert!(result.is_some());
+        let expanded = result.unwrap();
+        assert!(expanded.is_absolute());
+        // Should be the home directory itself
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(expanded, home);
+    }
+
+    #[test]
+    fn test_expand_home_absolute_path() {
+        // Test that /absolute/path returns None (no expansion)
+        let result = expand_home("/absolute/path");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_expand_home_relative_path() {
+        // Test that relative/path returns None (no expansion)
+        let result = expand_home("relative/path");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_resolve_path_relative_existing() {
+        // Test that a relative path that exists returns PathSource::Relative
+        let dir = tmp();
+        fs::write(dir.path().join("test.txt"), "content").unwrap();
+
+        let resolved = resolve_path(dir.path(), "test.txt");
+        assert_eq!(resolved.source, PathSource::Relative);
+        assert_eq!(resolved.full_path, dir.path().join("test.txt"));
+    }
+
+    #[test]
+    fn test_resolve_path_absolute() {
+        // Test that an absolute path returns PathSource::Absolute
+        let dir = tmp();
+        let resolved = resolve_path(dir.path(), "/tmp/absolute/path.txt");
+        assert_eq!(resolved.source, PathSource::Absolute);
+        assert_eq!(resolved.full_path, PathBuf::from("/tmp/absolute/path.txt"));
+    }
+
+    #[test]
+    fn test_resolve_path_home_expanded() {
+        // Test that ~/path returns PathSource::HomeExpanded
+        let dir = tmp();
+        let resolved = resolve_path(dir.path(), "~/config/settings.json");
+        assert_eq!(resolved.source, PathSource::HomeExpanded);
+        assert!(resolved.full_path.is_absolute());
+    }
+
+    #[test]
+    fn test_levenshtein_distance_identical() {
+        // Test distance between identical strings is 0
+        assert_eq!(levenshtein_distance("hello", "hello"), 0);
+        assert_eq!(levenshtein_distance("", ""), 0);
+    }
+
+    #[test]
+    fn test_levenshtein_distance_kitten_sitting() {
+        // Test distance between "kitten" and "sitting" is 3
+        // kitten -> sitten (substitution k->s)
+        // sitten -> sittin (substitution e->i)
+        // sittin -> sitting (insertion g)
+        assert_eq!(levenshtein_distance("kitten", "sitting"), 3);
+    }
+
+    #[test]
+    fn test_levenshtein_distance_empty_strings() {
+        // Test distance with empty strings
+        assert_eq!(levenshtein_distance("", "hello"), 5);
+        assert_eq!(levenshtein_distance("hello", ""), 5);
+        assert_eq!(levenshtein_distance("", ""), 0);
+    }
+
+    #[test]
+    fn test_levenshtein_distance_single_char() {
+        // Test single character differences
+        assert_eq!(levenshtein_distance("a", "b"), 1);
+        assert_eq!(levenshtein_distance("ab", "ac"), 1);
+    }
+
+    #[test]
+    fn test_find_similar_files_nonexistent_directory() {
+        // Test that it returns empty vec for non-existent directory
+        let results = find_similar_files(Path::new("/nonexistent/dir/12345"), "target.txt", 5);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_find_similar_files_finds_similar() {
+        // Test that it finds similar filenames (within the threshold)
+        let dir = tmp();
+        fs::write(dir.path().join("config.json"), "{}").unwrap();
+        fs::write(dir.path().join("config.yaml"), "key: value").unwrap();
+        fs::write(dir.path().join("settings.json"), "{}").unwrap();
+        fs::write(dir.path().join("readme.txt"), "hello").unwrap();
+
+        // Search for similar files to "config.json"
+        let results = find_similar_files(dir.path(), "config.json", 5);
+
+        // Should find config.json (distance 0), config.yaml (distance ~5)
+        assert!(!results.is_empty());
+
+        // First result should be exact match
+        assert_eq!(results[0].1, 0);
+        assert!(results[0].0.ends_with("config.json"));
+
+        // Check that config.yaml is found with some distance
+        let yaml_result = results.iter().find(|(p, _)| p.ends_with("config.yaml"));
+        assert!(yaml_result.is_some());
+        assert!(yaml_result.unwrap().1 <= 5);
+    }
+
+    #[test]
+    fn test_find_similar_files_ignores_directories() {
+        // Test that directories are ignored
+        let dir = tmp();
+        fs::create_dir(dir.path().join("subdir")).unwrap();
+        fs::write(dir.path().join("file.txt"), "content").unwrap();
+
+        let results = find_similar_files(dir.path(), "subdir", 0);
+        // Should not find the directory
+        assert!(results.is_empty());
     }
 }
 fn make_error_op(

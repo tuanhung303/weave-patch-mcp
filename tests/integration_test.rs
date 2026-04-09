@@ -925,9 +925,15 @@ fn test_llm_error_context_not_found() {
 /// Test: FileNotFound produces LLM-readable output
 #[test]
 fn test_llm_error_file_not_found() {
-    use weave_patch_mcp::error::PatchError;
+    use weave_patch_mcp::applier::PathSource;
+    use weave_patch_mcp::error::{FileNotFoundData, PatchError};
 
-    let err = PatchError::FileNotFound("missing.txt".to_string());
+    let err = PatchError::FileNotFound(FileNotFoundData {
+        path: "missing.txt".to_string(),
+        resolved_as: PathSource::Relative,
+        suggestions: vec![],
+        tried_paths: vec!["missing.txt".to_string()],
+    });
     let output = err.to_json();
 
     assert_eq!(output.file, "missing.txt");

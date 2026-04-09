@@ -1,5 +1,7 @@
 use std::fmt;
 
+use crate::applier::PathSource;
+
 fn fmt_positions(positions: &[usize]) -> String {
     positions
         .iter()
@@ -47,10 +49,23 @@ pub struct ContextNotFoundData {
     pub closest_matches: Vec<ClosestMatch>,
 }
 
+/// Detailed information for file not found errors.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FileNotFoundData {
+    /// The original path requested
+    pub path: String,
+    /// How the path was resolved (relative, absolute, home_expanded)
+    pub resolved_as: PathSource,
+    /// Similar existing files that might be what the user intended
+    pub suggestions: Vec<String>,
+    /// All paths that were tried during resolution
+    pub tried_paths: Vec<String>,
+}
+
 #[derive(Debug, serde::Serialize)]
 pub enum PatchError {
     Parse(String),
-    FileNotFound(String),
+    FileNotFound(FileNotFoundData),
     ContextNotFound(Box<ContextNotFoundData>),
     AmbiguousContext {
         path: String,
@@ -126,8 +141,8 @@ impl PatchError {
                         .join(", ")
                 ),
             },
-            PatchError::FileNotFound(path) => LLMErrorOutput {
-                file: path.clone(),
+            PatchError::FileNotFound(data) => LLMErrorOutput {
+                file: data.path.clone(),
                 failed_hunk: None,
                 applied_hunks: 0,
                 expected_context: vec![],
@@ -135,8 +150,10 @@ impl PatchError {
                 similarity_score: None,
                 suggested_action: "create_target_file_before_patch".to_string(),
                 recovery_hint: format!(
-                    "File '{}' does not exist. Create it first or check path.",
-                    path
+                    "File '{}' does not exist. Resolved as '{}'. Tried: {}",
+                    data.path,
+                    data.resolved_as,
+                    data.tried_paths.join(", ")
                 ),
             },
             PatchError::FileAlreadyExists(path) => LLMErrorOutput {
@@ -190,7 +207,16 @@ impl std::fmt::Display for PatchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             PatchError::Parse(msg) => write!(f, "parse error: {msg}"),
-            PatchError::FileNotFound(msg) => write!(f, "file not found: {msg}"),
+            PatchError::FileNotFound(data) => {
+                write!(f, "File not found: {}", data.path)?;
+                if !data.suggestions.is_empty() {
+                    write!(f, "\n  Similar files: {}", data.suggestions.join(", "))?;
+                }
+                if !data.tried_paths.is_empty() {
+                    write!(f, "\n  Tried paths: {}", data.tried_paths.join(", "))?;
+                }
+                write!(f, "\n  Resolved as: {}", data.resolved_as)
+            }
             PatchError::ContextNotFound(d) => {
                 writeln!(f, "context not found: {}", d.path)?;
                 writeln!(

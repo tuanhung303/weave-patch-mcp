@@ -10,7 +10,8 @@ use rmcp::{
 use serde::Deserialize;
 use std::path::Path;
 
-use crate::{applier, parser, reader};
+use crate::applier::{self, PathSource, ResolvedPath, resolve_path};
+use crate::{parser, reader};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct BatchExecParams {
@@ -147,13 +148,15 @@ impl WeavePatchServer {
                         offset,
                         limit,
                     } => {
-                        let content = match self.read_single_file(&canonical_base, path).await {
-                            Ok(c) => c,
-                            Err(e) => {
-                                read_results.push(format!("--- {} ---\nError: {}", path, e));
-                                continue;
-                            }
-                        };
+                        let (content, path_source) =
+                            match self.read_single_file(&canonical_base, path).await {
+                                Ok((c, ps)) => (c, ps),
+                                Err(e) => {
+                                    read_results
+                                        .push(format!("--- {} [base] ---\nError: {}", path, e));
+                                    continue;
+                                }
+                            };
 
                         // Apply default 1000-line truncation if no explicit limit/symbols
                         const DEFAULT_LINE_LIMIT: usize = 1000;
@@ -201,8 +204,8 @@ impl WeavePatchServer {
                         };
 
                         let mut file_out = format!(
-                            "--- {} {} ---\n{}{}",
-                            path, header_suffix, formatted, truncated_notice
+                            "--- {} [{}] {} ---\n{}{}",
+                            path, path_source, header_suffix, formatted, truncated_notice
                         );
 
                         if file_out.len() > MAX_FILE {
@@ -410,9 +413,9 @@ impl WeavePatchServer {
 
         let max_depth = max_depth.unwrap_or(DEFAULT_DEPTH);
         let output_limit = output_limit.unwrap_or(DEFAULT_LIMIT);
-
-        let full_path = applier::validate_path(base_dir, rel_path)
-            .map_err(|e| format!("Validation error: {e}"))?;
+        let resolved: ResolvedPath = resolve_path(base_dir, rel_path);
+        let full_path = resolved.full_path;
+        let path_source = resolved.source;
 
         if !full_path.exists() {
             return Err("Directory not found".to_string());
@@ -431,8 +434,12 @@ impl WeavePatchServer {
         match map_result {
             Ok(Ok((lines, metrics))) => {
                 let header = format!(
-                    "map: {} ({} files, {} lines total, depth={})",
-                    rel_path, metrics.file_count, metrics.total_lines, metrics.max_depth
+                    "map: {} [{}] ({} files, {} lines total, depth={})",
+                    rel_path,
+                    path_source,
+                    metrics.file_count,
+                    metrics.total_lines,
+                    metrics.max_depth
                 );
                 let mut output = vec![header];
                 output.extend(lines);
@@ -639,9 +646,14 @@ impl WeavePatchServer {
         }
     }
 
-    async fn read_single_file(&self, base_dir: &Path, rel_path: &str) -> Result<String, String> {
-        let full_path = applier::validate_path(base_dir, rel_path)
-            .map_err(|e| format!("Validation error: {e}"))?;
+    async fn read_single_file(
+        &self,
+        base_dir: &Path,
+        rel_path: &str,
+    ) -> Result<(String, PathSource), String> {
+        let resolved: ResolvedPath = resolve_path(base_dir, rel_path);
+        let full_path = resolved.full_path;
+        let path_source = resolved.source;
 
         if !full_path.exists() {
             return Err("File not found".to_string());
@@ -668,11 +680,16 @@ impl WeavePatchServer {
         const CHECK_SIZE: usize = 8192;
         let check_len = std::cmp::min(bytes.len(), CHECK_SIZE);
         if bytes[..check_len].contains(&0) {
-            return Ok("[binary file - content not displayed]".to_string());
+            return Ok((
+                "[binary file - content not displayed]".to_string(),
+                path_source,
+            ));
         }
 
         // Convert to string, handling UTF-8 errors gracefully
-        String::from_utf8(bytes).map_err(|e| format!("UTF-8 decode error: {e}"))
+        String::from_utf8(bytes)
+            .map(|s| (s, path_source))
+            .map_err(|e| format!("UTF-8 decode error: {e}"))
     }
 }
 
