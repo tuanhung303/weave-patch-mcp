@@ -453,6 +453,8 @@ fn prepare_op(
                         {
                             entry.1 = dest_path;
                         }
+                        // Queue original file for deletion (atomic with commit)
+                        tx.queue_deletion(full_path);
                         let mut op = make_op(
                             &path,
                             "update",
