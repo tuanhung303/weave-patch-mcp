@@ -240,6 +240,19 @@ update src/db.rs
 === end
 ```
 
+**Markdown / pipe tables (README, `.md`):** Table rows often start with `|` without a leading space. Those lines are treated as **context** so they are not skipped by the parser. For replacements, use `-|` and `+|` so the old and new rows are remove/add lines, for example:
+
+```
+=== begin
+update README.md
+@@
+-| Old | value |
++| New | value |
+=== end
+```
+
+If table rows were not recognized, a hunk could end up with only `+` lines; the matcher then has no anchor and **appends at end of file** (usually wrong).
+
 ### 5. Delete a file
 
 **Clean removal.** One call, file gone. No orphaned references left behind.
@@ -343,10 +356,10 @@ Every operation returns a structured `OpStatus` enum instead of a string:
 
 **CI/CD Pipeline** (triggered on push to `main`):
 
-**150 tests. Comprehensive test coverage. If it fails, nothing ships.**
+**175 tests. Comprehensive test coverage. If it fails, nothing ships.**
 
 ```
-test (fmt + clippy + 150 tests)
+test (fmt + clippy + 175 tests)
   ↓
 version-bump (auto-increment patch)
   ↓
@@ -375,11 +388,11 @@ Run tests:
 cargo test
 ```
 
-### Test Coverage (150 tests)
+### Test Coverage (175 tests)
 
 | Suite | Coverage |
 |---|---|
-| `tests/integration_test.rs` | Core patch operations, edge cases (Unicode, empty files, long lines, concurrent shadow collision, multi-op atomicity, CRLF) |
+| `tests/integration_test.rs` | Core patch operations, edge cases (Unicode, empty files, long lines, concurrent shadow collision, multi-op atomicity, CRLF, markdown pipe rows) |
 | `tests/server_test.rs` | MCP server, `patch__exec` (globs, line ranges, symbol extraction, patch operations, error handling) |
 | `tests/validator_test.rs` | All 7 language-specific advisory validators |
 | `src/parser.rs` (unit) | Compact syntax patch parsing, auto-wrap missing markers, multi-file, hints, Read/Map specs |

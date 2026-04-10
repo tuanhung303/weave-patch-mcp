@@ -1,6 +1,6 @@
 use std::fs;
 use tempfile::TempDir;
-use weave_patch_mcp::applier::{weave_patch, weave_patch_with_threshold};
+use weave_patch_mcp::applier::{OpStatus, weave_patch, weave_patch_with_threshold};
 use weave_patch_mcp::parser::parse_patch;
 
 fn tmp() -> TempDir {
@@ -1091,4 +1091,32 @@ fn test_threshold_above_1_clamped_to_1() {
         "Expected patch to fail with threshold 2.0 (clamped to 1.0, requires 100% similarity)"
     );
 }
-use weave_patch_mcp::applier::OpStatus;
+
+/// End-to-end: `-|` / `+|` table rows (always parsed). See parser tests for bare `|` context.
+#[test]
+fn test_markdown_table_pipe_remove_add() {
+    let dir = tmp();
+    fs::write(dir.path().join("table.md"), "| Old | v1 |\n").unwrap();
+
+    let input = concat!(
+        "=== begin\n",
+        "update table.md\n",
+        "@@\n",
+        "-| Old | v1 |\n",
+        "+| New | v2 |\n",
+        "=== end",
+    );
+
+    let ops = parse_patch(input).unwrap().ops;
+    let result = weave_patch(ops, dir.path());
+    assert_eq!(
+        result.operations[0].status,
+        OpStatus::Ok,
+        "{}",
+        result.operations[0].message
+    );
+
+    let content = fs::read_to_string(dir.path().join("table.md")).unwrap();
+    assert!(content.contains("| New | v2 |"), "got:\n{content}");
+    assert!(!content.contains("| Old | v1 |"), "got:\n{content}");
+}

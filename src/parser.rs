@@ -364,6 +364,12 @@ fn parse_update_section(lines: &[&str]) -> Result<(Vec<Hunk>, Option<String>), P
         } else if line == " " || line == "  " {
             // Empty context line
             Some(DiffLine::Context(String::new()))
+        } else if line.trim_start().starts_with('|') {
+            // Markdown pipe tables: rows often start with `|` without a leading space. Those
+            // lines were previously unrecognized (`diff_line` None) and silently skipped. A hunk
+            // that only retained `+` / `+|` lines then had an empty search_pattern, so the applier
+            // treated it as "additions only" and appended at EOF — the wrong behavior for table edits.
+            Some(DiffLine::Context(line.to_string()))
         } else {
             None
         };
@@ -769,5 +775,24 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
         assert!(err.contains("move requires two paths"));
+    }
+
+    /// Lines starting with `|` (markdown tables) must be context — not silently skipped — or hunks
+    /// with only `+` lines get empty search_pattern and the applier appends at EOF.
+    #[test]
+    fn test_parse_markdown_table_pipe_row_as_context() {
+        let input = "=== begin\nupdate doc.md\n@@\n| anchor |\n- remove\n+ add\n=== end";
+        let result = parse_patch(input).unwrap();
+        match &result.ops[0] {
+            FileOp::Update { hunks, .. } => {
+                assert_eq!(
+                    hunks[0].lines[0],
+                    DiffLine::Context("| anchor |".to_string())
+                );
+                assert_eq!(hunks[0].lines[1], DiffLine::Remove(" remove".to_string()));
+                assert_eq!(hunks[0].lines[2], DiffLine::Add(" add".to_string()));
+            }
+            _ => panic!("Expected Update"),
+        }
     }
 }

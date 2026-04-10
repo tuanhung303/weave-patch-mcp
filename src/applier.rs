@@ -1399,7 +1399,6 @@ fn find_matches_with_type(
 }
 
 /// Backwards-compatible wrapper that discards match type info.
-/// Backwards-compatible wrapper that discards match type info.
 #[allow(dead_code)]
 fn find_matches(file_lines: &[String], pattern: &[&str]) -> Vec<usize> {
     let (positions, _) = find_matches_with_type(file_lines, pattern, None);
