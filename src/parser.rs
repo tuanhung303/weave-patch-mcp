@@ -39,6 +39,10 @@ pub enum FileOp {
         depth: Option<usize>,
         output_limit: Option<usize>,
     },
+    Move {
+        from: String,
+        to: String,
+    },
 }
 
 /// Result of parsing a patch with optional threshold from begin marker.
@@ -58,6 +62,7 @@ pub fn parse_patch(input: &str) -> Result<ParseResult, PatchError> {
             || l.starts_with("delete ")
             || l.starts_with("read ")
             || l.starts_with("map ")
+            || l.starts_with("move ")
     });
 
     let input = if !has_begin && has_ops {
@@ -113,6 +118,7 @@ pub fn parse_patch(input: &str) -> Result<ParseResult, PatchError> {
                 || l.starts_with("delete ")
                 || l.starts_with("read ")
                 || l.starts_with("map ")
+                || l.starts_with("move ")
         })
         .map(|(i, _)| i)
         .collect();
@@ -158,6 +164,9 @@ pub fn parse_patch(input: &str) -> Result<ParseResult, PatchError> {
                 depth: spec.depth,
                 output_limit: spec.output_limit,
             });
+        } else if let Some(move_spec) = header.strip_prefix("move ") {
+            let (from, to) = parse_move_spec(move_spec)?;
+            ops.push(FileOp::Move { from, to });
         }
     }
 
@@ -221,6 +230,17 @@ fn parse_map_spec(spec: &str) -> MapSpec {
         depth,
         output_limit,
     }
+}
+
+/// Parse move specification: "move <from> <to>"
+fn parse_move_spec(spec: &str) -> Result<(String, String), PatchError> {
+    let parts: Vec<&str> = spec.split_whitespace().collect();
+    if parts.len() < 2 {
+        return Err(PatchError::Parse(
+            "move requires two paths: move <from> <to>".to_string(),
+        ));
+    }
+    Ok((parts[0].to_string(), parts[1].to_string()))
 }
 
 fn parse_add_content(lines: &[&str]) -> String {
@@ -726,5 +746,28 @@ mod tests {
             }
             _ => panic!("Expected Update"),
         }
+    }
+
+    #[test]
+    fn test_parse_move_file() {
+        let input = "=== begin\nmove src/old.rs src/new.rs\n=== end";
+        let result = parse_patch(input).unwrap();
+        assert_eq!(result.ops.len(), 1);
+        match &result.ops[0] {
+            FileOp::Move { from, to } => {
+                assert_eq!(from, "src/old.rs");
+                assert_eq!(to, "src/new.rs");
+            }
+            _ => panic!("Expected Move"),
+        }
+    }
+
+    #[test]
+    fn test_parse_move_missing_destination() {
+        let input = "=== begin\nmove src/old.rs\n=== end";
+        let result = parse_patch(input);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("move requires two paths"));
     }
 }

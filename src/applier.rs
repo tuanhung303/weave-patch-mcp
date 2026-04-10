@@ -83,6 +83,9 @@ pub struct OpResult {
     pub batch_total: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path_source: Option<PathSource>,
+    /// For partial batch failures: why this successful op was rolled back.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rollback_reason: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -117,6 +120,7 @@ fn make_op(
         path_source: None,
         batch_index: batch.map(|(idx, _)| idx),
         batch_total: batch.map(|(_, total)| total),
+        rollback_reason: None,
     }
 }
 
@@ -242,6 +246,7 @@ fn detect_file_conflicts(ops: &[FileOp]) -> Result<(), (String, String)> {
             FileOp::Delete { path } => (path.as_str(), "delete"),
             FileOp::Read { path, .. } => (path.as_str(), "read"),
             FileOp::Map { .. } => continue,
+            FileOp::Move { from, .. } => (from.as_str(), "move"),
         };
         path_ops.entry(path.to_string()).or_default().push(op_type);
     }
@@ -281,7 +286,7 @@ pub fn weave_patch_with_threshold(
     threshold: Option<f32>,
 ) -> PatchResult {
     // Step 1: Detect conflicts before any I/O
-    if let Err((path, msg)) = detect_file_conflicts(&ops) {
+    if let Err((conflict_path, conflict_msg)) = detect_file_conflicts(&ops) {
         // Return error for the conflicting operation
         let total = ops.len();
         let results: Vec<OpResult> = ops
@@ -294,6 +299,7 @@ pub fn weave_patch_with_threshold(
                     FileOp::Delete { .. } => "delete",
                     FileOp::Read { .. } => "read",
                     FileOp::Map { .. } => "map",
+                    FileOp::Move { .. } => "move",
                 };
                 let op_path = match op {
                     FileOp::Add { path, .. } => path,
@@ -301,23 +307,29 @@ pub fn weave_patch_with_threshold(
                     FileOp::Delete { path } => path,
                     FileOp::Read { path, .. } => path,
                     FileOp::Map { path, .. } => path,
+                    FileOp::Move { from, .. } => from,
                 };
-                if op_path == &path {
+                if op_path == &conflict_path {
                     make_op(
                         op_path,
                         op_type,
                         OpStatus::FatalError,
-                        &msg,
+                        &conflict_msg,
                         Some((i + 1, total)),
                     )
                 } else {
-                    make_op(
+                    let mut result = make_op(
                         op_path,
                         op_type,
                         OpStatus::Skipped,
                         "Skipped due to conflict",
                         Some((i + 1, total)),
-                    )
+                    );
+                    result.rollback_reason = Some(format!(
+                        "Conflict detected on {}: {}",
+                        conflict_path, conflict_msg
+                    ));
+                    result
                 }
             })
             .collect();
@@ -354,12 +366,24 @@ pub fn weave_patch_with_threshold(
     let mut results: Vec<OpResult> = results.into_iter().map(|(_, r)| r).collect();
 
     // Check if any operation failed
-    let failed = results
+    let failed_op = results
         .iter()
-        .any(|r| r.status == OpStatus::FatalError || r.status == OpStatus::RecoverableError);
+        .find(|r| r.status == OpStatus::FatalError || r.status == OpStatus::RecoverableError);
 
-    // If any op failed, Drop cleans up shadow files
-    if failed {
+    // If any op failed, Drop cleans up shadow files - set rollback_reason for OK ops
+    if let Some(failed) = failed_op {
+        let rollback_msg = format!(
+            "Batch rolled back due to failure at op {}/{}: {}",
+            failed.batch_index.unwrap_or(0),
+            failed.batch_total.unwrap_or(0),
+            failed.message
+        );
+        for r in &mut results {
+            if r.status == OpStatus::Ok {
+                r.status = OpStatus::Skipped;
+                r.rollback_reason = Some(rollback_msg.clone());
+            }
+        }
         return PatchResult {
             operations: results,
         };
@@ -368,11 +392,12 @@ pub fn weave_patch_with_threshold(
     // Step 3: Commit phase - sequential for atomicity
     if let Err(e) = transaction.commit() {
         // Mark all "ok" ops as failed due to commit error
-        let msg = format!("Commit failed: {e}");
+        let rollback_msg = format!("Commit failed: {e}");
         for r in &mut results {
             if r.status == OpStatus::Ok {
                 r.status = OpStatus::FatalError;
-                r.message = msg.clone();
+                r.message = rollback_msg.clone();
+                r.rollback_reason = Some(rollback_msg.clone());
             }
         }
     }
@@ -573,6 +598,116 @@ fn prepare_op(
             }
             Err(e) => make_error_op(&path, "map", &e, batch),
         },
+        FileOp::Move { from, to } => {
+            let full_from = match validate_path(base_dir, &from) {
+                Ok(p) => p,
+                Err(e) => return make_error_op(&from, "move", &e, batch),
+            };
+            let full_to = match validate_path(base_dir, &to) {
+                Ok(p) => p,
+                Err(e) => return make_error_op(&to, "move", &e, batch),
+            };
+
+            // Source must exist and not be a symlink
+            if !full_from.exists() {
+                return make_op(
+                    &from,
+                    "move",
+                    OpStatus::FatalError,
+                    "Source file not found",
+                    batch,
+                );
+            }
+            let meta = match full_from.symlink_metadata() {
+                Ok(m) => m,
+                Err(e) => {
+                    return make_op(
+                        &from,
+                        "move",
+                        OpStatus::FatalError,
+                        &format!("IO error: {e}"),
+                        batch,
+                    );
+                }
+            };
+            if meta.file_type().is_symlink() {
+                return make_op(
+                    &from,
+                    "move",
+                    OpStatus::FatalError,
+                    "Source is a symlink, move rejected",
+                    batch,
+                );
+            }
+            if !meta.is_file() {
+                return make_op(
+                    &from,
+                    "move",
+                    OpStatus::FatalError,
+                    "Source is not a regular file",
+                    batch,
+                );
+            }
+
+            // Destination must NOT exist
+            if full_to.exists() {
+                return make_op(
+                    &to,
+                    "move",
+                    OpStatus::FatalError,
+                    "Destination already exists",
+                    batch,
+                );
+            }
+
+            // Read source content
+            let content = match std::fs::read_to_string(&full_from) {
+                Ok(c) => c,
+                Err(e) => {
+                    return make_op(
+                        &from,
+                        "move",
+                        OpStatus::FatalError,
+                        &format!("Failed to read source: {e}"),
+                        batch,
+                    );
+                }
+            };
+
+            // Stage content to shadow destination
+            let shadow = shadow_path_for(&full_to);
+            if let Some(parent) = shadow.parent()
+                && let Err(e) = std::fs::create_dir_all(parent)
+            {
+                return make_op(
+                    &to,
+                    "move",
+                    OpStatus::FatalError,
+                    &format!("Failed to create parent dirs: {e}"),
+                    batch,
+                );
+            }
+            if let Err(e) = std::fs::write(&shadow, &content) {
+                return make_op(
+                    &to,
+                    "move",
+                    OpStatus::FatalError,
+                    &format!("Failed to stage move: {e}"),
+                    batch,
+                );
+            }
+            tx.stage(shadow, full_to);
+            tx.queue_deletion(full_from);
+
+            let line_count = content.lines().count();
+            make_op(
+                &from,
+                "move",
+                OpStatus::Ok,
+                &format!("move: {} -> {} ({} lines)", from, to, line_count),
+                batch,
+            )
+        }
     }
 }
 
@@ -2061,8 +2196,16 @@ mod tests {
             },
         ];
         let result = weave_patch(ops, dir.path());
-        // Op1 staged ok, op2 failed
-        assert_eq!(result.operations[0].status, OpStatus::Ok);
+        // Op1 was staged successfully but rolled back because op2 failed
+        assert_eq!(result.operations[0].status, OpStatus::Skipped);
+        assert!(result.operations[0].rollback_reason.is_some());
+        assert!(
+            result.operations[0]
+                .rollback_reason
+                .as_ref()
+                .unwrap()
+                .contains("rolled back")
+        );
         assert_eq!(result.operations[1].status, OpStatus::FatalError);
         // file1 must be UNCHANGED because commit was rolled back
         let content = fs::read_to_string(&file1).unwrap();
@@ -2573,6 +2716,127 @@ echo hello
         let results = find_similar_files(dir.path(), "subdir", 0);
         // Should not find the directory
         assert!(results.is_empty());
+    }
+
+    // ============================================
+    // Tests for move operation
+    // ============================================
+
+    #[test]
+    fn test_move_file_success() {
+        let dir = tmp();
+        let src = dir.path().join("source.txt");
+        fs::write(&src, "hello world\nline2\n").unwrap();
+
+        let ops = vec![FileOp::Move {
+            from: "source.txt".to_string(),
+            to: "dest.txt".to_string(),
+        }];
+        let result = weave_patch(ops, dir.path());
+
+        assert_eq!(result.operations[0].status, OpStatus::Ok);
+        assert_eq!(result.operations[0].op_type, "move");
+        assert!(result.operations[0].message.contains("source.txt"));
+        assert!(result.operations[0].message.contains("dest.txt"));
+        // Source should be deleted
+        assert!(!src.exists());
+        // Destination should exist with content
+        let dest = dir.path().join("dest.txt");
+        assert!(dest.exists());
+        assert_eq!(fs::read_to_string(&dest).unwrap(), "hello world\nline2\n");
+    }
+
+    #[test]
+    fn test_move_file_source_not_found() {
+        let dir = tmp();
+
+        let ops = vec![FileOp::Move {
+            from: "nonexistent.txt".to_string(),
+            to: "dest.txt".to_string(),
+        }];
+        let result = weave_patch(ops, dir.path());
+
+        assert_eq!(result.operations[0].status, OpStatus::FatalError);
+        assert!(
+            result.operations[0]
+                .message
+                .contains("Source file not found")
+        );
+    }
+
+    #[test]
+    fn test_move_file_dest_exists() {
+        let dir = tmp();
+        fs::write(dir.path().join("source.txt"), "source").unwrap();
+        fs::write(dir.path().join("dest.txt"), "dest").unwrap();
+
+        let ops = vec![FileOp::Move {
+            from: "source.txt".to_string(),
+            to: "dest.txt".to_string(),
+        }];
+        let result = weave_patch(ops, dir.path());
+
+        assert_eq!(result.operations[0].status, OpStatus::FatalError);
+        assert!(
+            result.operations[0]
+                .message
+                .contains("Destination already exists")
+        );
+        // Source should still exist
+        assert!(dir.path().join("source.txt").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_move_file_symlink_rejected() {
+        let dir = tmp();
+        let real = dir.path().join("real.txt");
+        let link = dir.path().join("link.txt");
+        fs::write(&real, "content").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let ops = vec![FileOp::Move {
+            from: "link.txt".to_string(),
+            to: "dest.txt".to_string(),
+        }];
+        let result = weave_patch(ops, dir.path());
+
+        assert_eq!(result.operations[0].status, OpStatus::FatalError);
+        assert!(result.operations[0].message.contains("symlink"));
+    }
+
+    #[test]
+    fn test_move_atomic_rollback_on_batch_failure() {
+        let dir = tmp();
+        fs::write(dir.path().join("file1.txt"), "content1\n").unwrap();
+
+        let ops = vec![
+            FileOp::Move {
+                from: "file1.txt".to_string(),
+                to: "moved.txt".to_string(),
+            },
+            FileOp::Update {
+                path: "nonexistent.txt".to_string(),
+                hunks: vec![],
+                move_to: None,
+            },
+        ];
+        let result = weave_patch(ops, dir.path());
+
+        // First op was staged successfully but rolled back because second op failed
+        assert_eq!(result.operations[0].status, OpStatus::Skipped);
+        assert!(result.operations[0].rollback_reason.is_some());
+        assert!(
+            result.operations[0]
+                .rollback_reason
+                .as_ref()
+                .unwrap()
+                .contains("rolled back")
+        );
+        assert_eq!(result.operations[1].status, OpStatus::FatalError);
+        // Rollback: source should still exist, dest should NOT exist
+        assert!(dir.path().join("file1.txt").exists());
+        assert!(!dir.path().join("moved.txt").exists());
     }
 }
 fn make_error_op(
