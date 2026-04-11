@@ -16,7 +16,7 @@ use crate::{parser, reader};
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct BatchExecParams {
     #[schemars(
-        description = "Compact syntax patch text containing Read, Add, Update, Delete operations. Wrap in === begin / === end."
+        description = "Compact patch text containing view/read, map, create, write, update, move, and delete operations. Wrap in === begin / === end."
     )]
     pub patch: String,
 
@@ -49,7 +49,7 @@ impl WeavePatchServer {
 
     #[tool(
         name = "patch__exec",
-        description = "Unified workspace tool: read, map, add, update, and delete files atomically. Supports batch operations — read multiple files in a single call (prefer over repeated cat/head/tail).\nVersion: 0.0.15\n\nFORMAT: wrap everything in === begin / === end.\n\nEXAMPLES:\n\n1. Read a file:\n  === begin\n  read src/main.rs\n  === end\n\n2. Read with symbols:\n  === begin\n  read src/lib.rs symbols=Server,handle_request language=rust\n  === end\n\n3. Read with line range:\n  === begin\n  read config.py offset=10 limit=50\n  === end\n\n4. Map a directory:\n  === begin\n  map src/ depth=2\n  === end\n\n5. Add a new file (raw text, no +/- prefixes):\n  === begin\n  create src/hello.rs\n  pub fn hello() { println!(\"Hello!\"); }\n  === end\n\n6. Update a file (+/- for changes, preserve indentation):\n  === begin\n  update src/lib.rs\n  @@ fn main\n   fn main() {\n  -    old_code();\n  +    new_code();\n   }\n  === end\n\n7. Update with multiple hunks:\n  === begin\n  update src/lib.rs\n  @@ fn setup\n   fn setup() {\n  -    old_init();\n  +    new_init();\n   }\n  @@ fn teardown\n   fn teardown() {\n  -    old_cleanup();\n  +    new_cleanup();\n   }\n  === end\n\n8. Rename a file (update with move_to):\n  === begin\n  update src/old.rs\n  move_to src/new.rs\n  @@ fn foo\n   fn foo() { ... }\n  === end\n\n9. Move a file (dedicated syntax):\n  === begin\n  move src/old.rs src/new.rs\n  === end\n\n10. Delete a file:\n  === begin\n  delete src/old.rs\n  === end\n\n11. Combined operations:\n  === begin\n  read src/main.rs\n  update src/lib.rs\n  @@ fn main\n   fn main() {\n  -    old();\n  +    new();\n   }\n  create src/greet.rs\n  pub fn greet() { println!(\"hi\"); }\n  delete src/deprecated.rs\n  === end\n\n12. Read multiple files:\n  === begin\n  read src/main.rs\n  read src/lib.rs\n  read src/config.rs\n  === end\n\n13. Update multiple files:\n  === begin\n  update src/api.rs\n  @@ fn handle\n   fn handle() {\n  -    old();\n  +    new();\n   }\n  update src/db.rs\n  @@ fn connect\n   fn connect() {\n  -    let url = \"old\";\n  +    let url = \"new\";\n   }\n  === end\n\n14. Delete multiple files:\n  === begin\n  delete src/deprecated1.rs\n  delete src/deprecated2.rs\n  delete src/deprecated3.rs\n  === end\n\nDEFAULTS:\n  - Fuzzy matching threshold: 0.97 (strict matching for updates)\n  - Map depth: 3, output limit: 6000 chars\n  - File read truncation: 1000 lines (unless symbols/limit specified)\n\nOPTIONS:\n  read <path> [symbols=a,b] [language=rust] [offset=N] [limit=N]\n  map <path> [depth=N] [limit=N]  (default: depth=3, limit=6000)\n  update <path>   @@ hint (optional)   context/ -/ + lines\n  create <path>   content lines (raw text, no prefixes)\n  delete <path>   no body needed\n  move <from> <to>   atomic rename (source must exist, dest must not exist)\n  move_to <path>  (inside Update, renames file after edit)\n\nPARAMETERS:\n  patch: String (required) — Compact syntax patch text wrapped in === begin / === end.\n  threshold: Option<f32> (optional, default 0.97) — Fuzzy matching threshold for updates. Higher values (e.g., 0.99) require stricter matching.\n\nUPDATE RULES:\n  - Provide 2-3 unique context lines above and below each change\n  - Preserve exact indentation (whitespace matching is strict)\n  - Use - prefix for lines to remove, + prefix for lines to add\n\nLIMITS:\n  - Files over 1000 lines truncated unless symbols/limit used\n  - Binary files unsupported/ignored\n\nSECURITY: No symlinks. Relative paths (including ../), absolute paths, and ~ home expansion are allowed.\n\nVALIDATORS (advisory, non-blocking):\n  .rs   → rustfmt --check\n  .py   → python -m py_compile\n  .go   → gofmt -l\n  .json → python3 -m json.tool\n  .js   → node --check\n  .sh   → bash -n\n  .tf   → terraform fmt -check"
+        description = "Unified workspace tool for agents moving from Copilot CLI `view` + `apply_patch`: `view`/`read`, `map`, `create`, `write`, `update`, `move`, and `delete` in one atomic call.\nVersion: 0.0.15\n\nFORMAT: wrap operations in === begin / === end.\n\nFAMILIAR ALIASES:\n  - view <path> ...      alias for read\n  - write <path> ...     create or overwrite a whole file atomically\n  - create/write bodies  accept raw text or apply_patch-style + lines\n\nEXAMPLES:\n\n1. View a file:\n  === begin\n  view src/main.rs\n  === end\n\n2. View with 1-based line range:\n  === begin\n  view src/lib.rs start=11 end=40\n  === end\n\n3. Read with symbols:\n  === begin\n  read src/lib.rs symbols=Server,handle_request language=rust\n  === end\n\n4. Write a file (create or overwrite):\n  === begin\n  write src/hello.rs\n  +pub fn hello() { println!(\"Hello!\"); }\n  === end\n\n5. Update a file:\n  === begin\n  update src/lib.rs\n  @@ fn main\n   fn main() {\n  -    old_code();\n  +    new_code();\n   }\n  === end\n\n6. Move a file:\n  === begin\n  move src/old.rs src/new.rs\n  === end\n\n7. Combined operations:\n  === begin\n  view src/main.rs\n  update src/lib.rs\n  @@ fn main\n   fn main() {\n  -    old();\n  +    new();\n   }\n  write src/greet.rs\n  +pub fn greet() { println!(\"hi\"); }\n  delete src/deprecated.rs\n  === end\n\nOPTIONS:\n  view|read <path> [symbols=a,b] [language=rust] [offset=N] [limit=N] [start=N] [end=N]\n  map <path> [depth=N] [limit=N]\n  create <path>   content lines (create only; raw text or all + lines)\n  write <path>    content lines (create or overwrite; raw text or all + lines)\n  update <path>   @@ hint (optional)   context/ -/ + lines\n  delete <path>\n  move <from> <to>\n  move_to <path>  (inside Update)\n\nDEFAULTS:\n  - Fuzzy matching threshold: 0.97\n  - Map depth: 3, output limit: 6000 chars\n  - File read truncation: 1000 lines unless symbols/limit/start-end specified\n\nSECURITY: No symlinks. Relative paths (including ../), absolute paths, and ~ home expansion are allowed.\n\nVALIDATORS (advisory): rustfmt, py_compile, gofmt, json.tool, bash -n, node --check, terraform fmt"
     )]
     async fn exec(
         &self,
@@ -271,6 +271,11 @@ impl WeavePatchServer {
                 .iter()
                 .filter(|op| op.op_type == "add")
                 .count();
+            let writes = result
+                .operations
+                .iter()
+                .filter(|op| op.op_type == "write")
+                .count();
             let updates = result
                 .operations
                 .iter()
@@ -286,11 +291,14 @@ impl WeavePatchServer {
             let mut lines: Vec<String> = Vec::new();
 
             // Prepend summary header for write operations
-            if creates + updates + deletes > 0 {
+            if creates + writes + updates + deletes > 0 {
                 let mut summary = format!("✓ {} operations completed", total);
                 let mut parts = Vec::new();
                 if creates > 0 {
                     parts.push(format!("{} created", creates));
+                }
+                if writes > 0 {
+                    parts.push(format!("{} written", writes));
                 }
                 if updates > 0 {
                     parts.push(format!("{} updated", updates));
@@ -331,6 +339,19 @@ impl WeavePatchServer {
                             format!(
                                 "✓ {} \u{2014} {} ({} lines){}{}",
                                 op.op_type, op.path, after, warn_suffix, batch_suffix
+                            )
+                        } else {
+                            format!(
+                                "✓ {} \u{2014} {}{}{}",
+                                op.op_type, op.path, warn_suffix, batch_suffix
+                            )
+                        }
+                    }
+                    "write" => {
+                        if let Some((before, after)) = op.line_changes {
+                            format!(
+                                "✓ {} \u{2014} {} ({} \u{2192} {} lines){}{}",
+                                op.op_type, op.path, before, after, warn_suffix, batch_suffix
                             )
                         } else {
                             format!(
@@ -418,7 +439,9 @@ impl WeavePatchServer {
         let path_source = resolved.source;
 
         if !full_path.exists() {
-            return Err("Directory not found".to_string());
+            return Err(
+                applier::file_not_found_error(rel_path, &full_path, path_source).to_string(),
+            );
         }
 
         if !full_path.is_dir() {
@@ -656,7 +679,9 @@ impl WeavePatchServer {
         let path_source = resolved.source;
 
         if !full_path.exists() {
-            return Err("File not found".to_string());
+            return Err(
+                applier::file_not_found_error(rel_path, &full_path, path_source).to_string(),
+            );
         }
 
         let meta = tokio::fs::symlink_metadata(&full_path)
@@ -872,9 +897,9 @@ impl ServerHandler for WeavePatchServer {
         )
         .with_instructions(
             "Structured file patching MCP server. One tool: patch__exec.\n\n\
-             Unified format: Read, Add, Update, Delete files in === begin / === end.\n\n\
-             Read: read  <path> [symbols=a,b] [language=rust] [offset=0] [limit=100]\n\n\
-             Write: create/update/delete  <path>\n\n\
+             Migration-friendly format: view/read, map, create, write, update, move, delete in === begin / === end.\n\n\
+             View/read: view|read <path> [symbols=a,b] [language=rust] [offset=0] [limit=100] [start=1] [end=20]\n\n\
+             Create/write: create|write <path> followed by raw text or apply_patch-style + lines.\n\n\
              Security: no symlinks. Relative paths (including ../), absolute paths, and ~ home expansion are allowed.\n\n\
              Validators: rustfmt, gofmt, py_compile, json.tool, bash -n, node --check, terraform fmt (advisory)."
         )

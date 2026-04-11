@@ -124,6 +124,12 @@ fn make_op(
     }
 }
 
+#[must_use]
+fn with_path_source(mut op: OpResult, path_source: PathSource) -> OpResult {
+    op.path_source = Some(path_source);
+    op
+}
+
 /// Two-phase commit: stages shadow files, commits atomically, rolls back on Drop if not committed.
 struct PatchTransaction {
     staged_files: Arc<Mutex<Vec<(PathBuf, PathBuf)>>>, // (shadow_path, target_path)
@@ -233,8 +239,7 @@ fn shadow_suffix() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-/// Detect file conflicts: Add+Update on same path is an error.
-/// Returns a map of path -> list of operation types for conflict reporting.
+/// Detect conflicting write operations that target the same path.
 fn detect_file_conflicts(ops: &[FileOp]) -> Result<(), (String, String)> {
     use std::collections::HashMap;
     let mut path_ops: HashMap<String, Vec<&str>> = HashMap::new();
@@ -242,25 +247,32 @@ fn detect_file_conflicts(ops: &[FileOp]) -> Result<(), (String, String)> {
     for op in ops {
         let (path, op_type) = match op {
             FileOp::Add { path, .. } => (path.as_str(), "add"),
+            FileOp::Write { path, .. } => (path.as_str(), "write"),
             FileOp::Update { path, .. } => (path.as_str(), "update"),
             FileOp::Delete { path } => (path.as_str(), "delete"),
-            FileOp::Read { path, .. } => (path.as_str(), "read"),
-            FileOp::Map { .. } => continue,
+            FileOp::Read { .. } | FileOp::Map { .. } => continue,
             FileOp::Move { from, .. } => (from.as_str(), "move"),
         };
         path_ops.entry(path.to_string()).or_default().push(op_type);
     }
 
-    // Check for Add+Update conflict on same path.
-    // Note: Update+Update on same path is intentionally NOT an error.
-    // Use multiple hunks within a single Update operation for multi-edit patches.
     for (path, ops_list) in &path_ops {
         let has_add = ops_list.contains(&"add");
         let has_update = ops_list.contains(&"update");
+        let write_count = ops_list.iter().filter(|&&op| op == "write").count();
+
         if has_add && has_update {
             return Err((
                 path.clone(),
                 "Cannot Add and Update the same file in one patch".to_string(),
+            ));
+        }
+
+        if write_count > 0 && ops_list.len() > 1 {
+            return Err((
+                path.clone(),
+                "Cannot combine Write with other write operations on the same file in one patch"
+                    .to_string(),
             ));
         }
     }
@@ -295,6 +307,7 @@ pub fn weave_patch_with_threshold(
             .map(|(i, op)| {
                 let op_type = match op {
                     FileOp::Add { .. } => "add",
+                    FileOp::Write { .. } => "write",
                     FileOp::Update { .. } => "update",
                     FileOp::Delete { .. } => "delete",
                     FileOp::Read { .. } => "read",
@@ -303,6 +316,7 @@ pub fn weave_patch_with_threshold(
                 };
                 let op_path = match op {
                     FileOp::Add { path, .. } => path,
+                    FileOp::Write { path, .. } => path,
                     FileOp::Update { path, .. } => path,
                     FileOp::Delete { path } => path,
                     FileOp::Read { path, .. } => path,
@@ -417,31 +431,47 @@ fn prepare_op(
 ) -> OpResult {
     match op {
         FileOp::Add { path, content } => {
-            let full_path = match validate_path(base_dir, &path) {
-                Ok(p) => p,
-                Err(e) => return make_error_op(&path, "add", &e, batch),
-            };
+            let resolved = resolve_path(base_dir, &path);
+            let full_path = resolved.full_path;
             match stage_add(&full_path, &content, tx) {
                 Ok(result) => {
                     let mut op = make_op(&path, "add", OpStatus::Ok, &result.message, batch);
                     op.warnings = result.warnings;
                     op.diff = result.diff;
                     op.line_changes = result.line_changes;
-                    op
+                    with_path_source(op, resolved.source)
                 }
-                Err(e) => make_error_op(&path, "add", &e, batch),
+                Err(e) => with_path_source(make_error_op(&path, "add", &e, batch), resolved.source),
+            }
+        }
+        FileOp::Write { path, content } => {
+            let resolved = resolve_path(base_dir, &path);
+            let full_path = resolved.full_path;
+            match stage_write(&full_path, &path, &content, tx) {
+                Ok(result) => {
+                    let mut op = make_op(&path, "write", OpStatus::Ok, &result.message, batch);
+                    op.warnings = result.warnings;
+                    op.diff = result.diff;
+                    op.line_changes = result.line_changes;
+                    with_path_source(op, resolved.source)
+                }
+                Err(e) => {
+                    with_path_source(make_error_op(&path, "write", &e, batch), resolved.source)
+                }
             }
         }
         FileOp::Delete { path } => {
-            match validate_path(base_dir, &path)
-                .and_then(|full_path| stage_delete(&full_path, &path, tx))
-            {
+            let resolved = resolve_path(base_dir, &path);
+            let full_path = resolved.full_path;
+            match stage_delete(&full_path, &path, resolved.source, tx) {
                 Ok(result) => {
                     let mut op = make_op(&path, "delete", OpStatus::Ok, &result.message, batch);
                     op.line_changes = result.line_changes;
-                    op
+                    with_path_source(op, resolved.source)
                 }
-                Err(e) => make_error_op(&path, "delete", &e, batch),
+                Err(e) => {
+                    with_path_source(make_error_op(&path, "delete", &e, batch), resolved.source)
+                }
             }
         }
         FileOp::Update {
@@ -449,26 +479,13 @@ fn prepare_op(
             hunks,
             move_to,
         } => {
-            let full_path = match validate_path(base_dir, &path) {
-                Ok(p) => p,
-                Err(e) => return make_error_op(&path, "update", &e, batch),
-            };
+            let resolved = resolve_path(base_dir, &path);
+            let full_path = resolved.full_path;
 
-            match stage_update(&full_path, &path, &hunks, tx, threshold) {
+            match stage_update(&full_path, &path, resolved.source, &hunks, tx, threshold) {
                 Ok(result) => {
                     if let Some(ref dest) = move_to {
-                        let dest_path = match validate_path(base_dir, dest) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                return make_op(
-                                    &path,
-                                    "update",
-                                    OpStatus::FatalError,
-                                    &format!("Update succeeded but move_to invalid: {e}"),
-                                    batch,
-                                );
-                            }
-                        };
+                        let dest_path = resolve_path(base_dir, dest).full_path;
                         // Re-target the staged shadow to move destination
                         if let Some(entry) = tx
                             .staged_files
@@ -491,17 +508,19 @@ fn prepare_op(
                         op.diff = result.diff;
                         op.line_changes = result.line_changes;
                         op.match_info = result.match_info;
-                        op
+                        with_path_source(op, resolved.source)
                     } else {
                         let mut op = make_op(&path, "update", OpStatus::Ok, &result.message, batch);
                         op.warnings = result.warnings;
                         op.diff = result.diff;
                         op.line_changes = result.line_changes;
                         op.match_info = result.match_info;
-                        op
+                        with_path_source(op, resolved.source)
                     }
                 }
-                Err(e) => make_error_op(&path, "update", &e, batch),
+                Err(e) => {
+                    with_path_source(make_error_op(&path, "update", &e, batch), resolved.source)
+                }
             }
         }
         FileOp::Read {
@@ -512,151 +531,179 @@ fn prepare_op(
             limit: _,
         } => {
             // Read operations don't stage files — they just validate and return success
-            match validate_path(base_dir, &path) {
-                Ok(full_path) => {
-                    if !full_path.exists() {
-                        return make_op(
+            let resolved = resolve_path(base_dir, &path);
+            let full_path = resolved.full_path;
+            if !full_path.exists() {
+                return with_path_source(
+                    make_error_op(
+                        &path,
+                        "read",
+                        &file_not_found_error(&path, &full_path, resolved.source),
+                        batch,
+                    ),
+                    resolved.source,
+                );
+            }
+            let meta = match full_path.symlink_metadata() {
+                Ok(m) => m,
+                Err(e) => {
+                    return with_path_source(
+                        make_op(
                             &path,
                             "read",
                             OpStatus::FatalError,
-                            "File not found",
+                            &format!("IO error: {e}"),
                             batch,
-                        );
-                    }
-                    let meta = match full_path.symlink_metadata() {
-                        Ok(m) => m,
-                        Err(e) => {
-                            return make_op(
-                                &path,
-                                "read",
-                                OpStatus::FatalError,
-                                &format!("IO error: {e}"),
-                                batch,
-                            );
-                        }
-                    };
-                    if meta.file_type().is_symlink() {
-                        return make_op(
-                            &path,
-                            "read",
-                            OpStatus::FatalError,
-                            "Symlink rejected",
-                            batch,
-                        );
-                    }
-                    if !meta.is_file() {
-                        return make_op(
-                            &path,
-                            "read",
-                            OpStatus::FatalError,
-                            "Not a regular file",
-                            batch,
-                        );
-                    }
+                        ),
+                        resolved.source,
+                    );
+                }
+            };
+            if meta.file_type().is_symlink() {
+                return with_path_source(
                     make_op(
                         &path,
                         "read",
-                        OpStatus::Ok,
-                        &format!("read: {} (ok)", path),
+                        OpStatus::FatalError,
+                        "Symlink rejected",
                         batch,
-                    )
-                }
-                Err(e) => make_error_op(&path, "read", &e, batch),
+                    ),
+                    resolved.source,
+                );
             }
+            if !meta.is_file() {
+                return with_path_source(
+                    make_op(
+                        &path,
+                        "read",
+                        OpStatus::FatalError,
+                        "Not a regular file",
+                        batch,
+                    ),
+                    resolved.source,
+                );
+            }
+            with_path_source(
+                make_op(
+                    &path,
+                    "read",
+                    OpStatus::Ok,
+                    &format!("read: {} (ok)", path),
+                    batch,
+                ),
+                resolved.source,
+            )
         }
         FileOp::Map {
             path,
             depth: _,
             output_limit: _,
-        } => match validate_path(base_dir, &path) {
-            Ok(full_path) => {
-                if !full_path.exists() {
-                    return make_op(
+        } => {
+            let resolved = resolve_path(base_dir, &path);
+            let full_path = resolved.full_path;
+            if !full_path.exists() {
+                return with_path_source(
+                    make_error_op(
                         &path,
                         "map",
-                        OpStatus::FatalError,
-                        "Directory not found",
+                        &file_not_found_error(&path, &full_path, resolved.source),
                         batch,
-                    );
-                }
-                if !full_path.is_dir() {
-                    return make_op(
+                    ),
+                    resolved.source,
+                );
+            }
+            if !full_path.is_dir() {
+                return with_path_source(
+                    make_op(
                         &path,
                         "map",
                         OpStatus::FatalError,
                         "Path is not a directory",
                         batch,
-                    );
-                }
+                    ),
+                    resolved.source,
+                );
+            }
+            with_path_source(
                 make_op(
                     &path,
                     "map",
                     OpStatus::Ok,
                     &format!("map: {} (ok)", path),
                     batch,
-                )
-            }
-            Err(e) => make_error_op(&path, "map", &e, batch),
-        },
+                ),
+                resolved.source,
+            )
+        }
         FileOp::Move { from, to } => {
-            let full_from = match validate_path(base_dir, &from) {
-                Ok(p) => p,
-                Err(e) => return make_error_op(&from, "move", &e, batch),
-            };
-            let full_to = match validate_path(base_dir, &to) {
-                Ok(p) => p,
-                Err(e) => return make_error_op(&to, "move", &e, batch),
-            };
+            let resolved_from = resolve_path(base_dir, &from);
+            let full_from = resolved_from.full_path;
+            let resolved_to = resolve_path(base_dir, &to);
+            let full_to = resolved_to.full_path;
 
             // Source must exist and not be a symlink
             if !full_from.exists() {
-                return make_op(
-                    &from,
-                    "move",
-                    OpStatus::FatalError,
-                    "Source file not found",
-                    batch,
+                return with_path_source(
+                    make_error_op(
+                        &from,
+                        "move",
+                        &file_not_found_error(&from, &full_from, resolved_from.source),
+                        batch,
+                    ),
+                    resolved_from.source,
                 );
             }
             let meta = match full_from.symlink_metadata() {
                 Ok(m) => m,
                 Err(e) => {
-                    return make_op(
-                        &from,
-                        "move",
-                        OpStatus::FatalError,
-                        &format!("IO error: {e}"),
-                        batch,
+                    return with_path_source(
+                        make_op(
+                            &from,
+                            "move",
+                            OpStatus::FatalError,
+                            &format!("IO error: {e}"),
+                            batch,
+                        ),
+                        resolved_from.source,
                     );
                 }
             };
             if meta.file_type().is_symlink() {
-                return make_op(
-                    &from,
-                    "move",
-                    OpStatus::FatalError,
-                    "Source is a symlink, move rejected",
-                    batch,
+                return with_path_source(
+                    make_op(
+                        &from,
+                        "move",
+                        OpStatus::FatalError,
+                        "Source is a symlink, move rejected",
+                        batch,
+                    ),
+                    resolved_from.source,
                 );
             }
             if !meta.is_file() {
-                return make_op(
-                    &from,
-                    "move",
-                    OpStatus::FatalError,
-                    "Source is not a regular file",
-                    batch,
+                return with_path_source(
+                    make_op(
+                        &from,
+                        "move",
+                        OpStatus::FatalError,
+                        "Source is not a regular file",
+                        batch,
+                    ),
+                    resolved_from.source,
                 );
             }
 
             // Destination must NOT exist
             if full_to.exists() {
-                return make_op(
-                    &to,
-                    "move",
-                    OpStatus::FatalError,
-                    "Destination already exists",
-                    batch,
+                return with_path_source(
+                    make_op(
+                        &to,
+                        "move",
+                        OpStatus::FatalError,
+                        "Destination already exists",
+                        batch,
+                    ),
+                    resolved_to.source,
                 );
             }
 
@@ -664,12 +711,15 @@ fn prepare_op(
             let content = match std::fs::read_to_string(&full_from) {
                 Ok(c) => c,
                 Err(e) => {
-                    return make_op(
-                        &from,
-                        "move",
-                        OpStatus::FatalError,
-                        &format!("Failed to read source: {e}"),
-                        batch,
+                    return with_path_source(
+                        make_op(
+                            &from,
+                            "move",
+                            OpStatus::FatalError,
+                            &format!("Failed to read source: {e}"),
+                            batch,
+                        ),
+                        resolved_from.source,
                     );
                 }
             };
@@ -679,42 +729,48 @@ fn prepare_op(
             if let Some(parent) = shadow.parent()
                 && let Err(e) = std::fs::create_dir_all(parent)
             {
-                return make_op(
-                    &to,
-                    "move",
-                    OpStatus::FatalError,
-                    &format!("Failed to create parent dirs: {e}"),
-                    batch,
+                return with_path_source(
+                    make_op(
+                        &to,
+                        "move",
+                        OpStatus::FatalError,
+                        &format!("Failed to create parent dirs: {e}"),
+                        batch,
+                    ),
+                    resolved_to.source,
                 );
             }
             if let Err(e) = std::fs::write(&shadow, &content) {
-                return make_op(
-                    &to,
-                    "move",
-                    OpStatus::FatalError,
-                    &format!("Failed to stage move: {e}"),
-                    batch,
+                return with_path_source(
+                    make_op(
+                        &to,
+                        "move",
+                        OpStatus::FatalError,
+                        &format!("Failed to stage move: {e}"),
+                        batch,
+                    ),
+                    resolved_to.source,
                 );
             }
             tx.stage(shadow, full_to);
             tx.queue_deletion(full_from);
 
             let line_count = content.lines().count();
-            make_op(
-                &from,
-                "move",
-                OpStatus::Ok,
-                &format!("move: {} -> {} ({} lines)", from, to, line_count),
-                batch,
+            with_path_source(
+                make_op(
+                    &from,
+                    "move",
+                    OpStatus::Ok,
+                    &format!("move: {} -> {} ({} lines)", from, to, line_count),
+                    batch,
+                ),
+                resolved_from.source,
             )
         }
     }
 }
 
-/// Validate that `rel_path` resolves to a location strictly inside `base_dir`.
-/// Rejects absolute paths and path traversal sequences (`../`).
-/// For new files (Add), canonicalizes the nearest existing parent.
-/// Rejects the path if it is a symlink.
+/// Reject a symlink target before any file operation touches it.
 pub fn check_symlink(path: &Path, display_path: &str) -> Result<(), PatchError> {
     let meta = path.symlink_metadata()?;
     if meta.file_type().is_symlink() {
@@ -854,6 +910,43 @@ pub fn find_similar_files(dir: &Path, target: &str, max_distance: usize) -> Vec<
     results
 }
 
+fn similar_path_suggestions(display_path: &str, resolved_path: &Path) -> Vec<String> {
+    let target_path = Path::new(display_path);
+    let target_name = match target_path.file_name().and_then(|n| n.to_str()) {
+        Some(name) => name,
+        None => return Vec::new(),
+    };
+    let parent = match resolved_path.parent() {
+        Some(parent) => parent,
+        None => return Vec::new(),
+    };
+    let display_parent = target_path.parent().filter(|p| !p.as_os_str().is_empty());
+
+    find_similar_files(parent, target_name, 4)
+        .into_iter()
+        .filter_map(|(candidate, _)| {
+            let file_name = candidate.file_name()?.to_str()?;
+            Some(match display_parent {
+                Some(prefix) => prefix.join(file_name).to_string_lossy().replace('\\', "/"),
+                None => file_name.to_string(),
+            })
+        })
+        .collect()
+}
+
+pub fn file_not_found_error(
+    display_path: &str,
+    resolved_path: &Path,
+    path_source: PathSource,
+) -> PatchError {
+    PatchError::FileNotFound(FileNotFoundData {
+        path: display_path.to_string(),
+        resolved_as: path_source,
+        suggestions: similar_path_suggestions(display_path, resolved_path),
+        tried_paths: vec![resolved_path.display().to_string()],
+    })
+}
+
 /// Result from stage_add
 struct StageAddResult {
     message: String,
@@ -892,6 +985,76 @@ fn stage_add(
     })
 }
 
+struct StageWriteResult {
+    message: String,
+    warnings: Vec<String>,
+    diff: Option<String>,
+    line_changes: Option<(usize, usize)>,
+}
+
+fn stage_write(
+    path: &Path,
+    display_path: &str,
+    content: &str,
+    tx: &PatchTransaction,
+) -> Result<StageWriteResult, PatchError> {
+    let mut original: Option<String> = None;
+    let mut original_line_count = 0;
+
+    if path.exists() {
+        let meta = path.symlink_metadata()?;
+        if meta.file_type().is_symlink() {
+            return Err(PatchError::SymlinkRejected(display_path.to_string()));
+        }
+        if !meta.is_file() {
+            return Err(PatchError::Io(std::io::Error::other(
+                "write target is not a regular file",
+            )));
+        }
+
+        let existing = std::fs::read_to_string(path)?
+            .replace("\r\n", "\n")
+            .replace('\r', "\n");
+        original_line_count = existing.lines().count();
+        original = Some(existing);
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let new_lines: Vec<&str> = content.lines().collect();
+    let new_line_count = new_lines.len();
+    let diff = match original.as_deref() {
+        Some(existing) => generate_unified_diff(existing, content, display_path),
+        None => generate_add_diff(path, &new_lines),
+    };
+
+    let shadow = shadow_path_for(path);
+    std::fs::write(&shadow, content)?;
+    let warnings = crate::validator::validate_file(&shadow, path);
+    tx.stage(shadow, path.to_path_buf());
+
+    let message = if original.is_some() {
+        format!(
+            "write: {} ({}→{} lines)",
+            display_path, original_line_count, new_line_count
+        )
+    } else {
+        format!(
+            "write: {} (created, {} lines)",
+            display_path, new_line_count
+        )
+    };
+
+    Ok(StageWriteResult {
+        message,
+        warnings,
+        diff,
+        line_changes: Some((original_line_count, new_line_count)),
+    })
+}
+
 /// Result from stage_delete
 struct StageDeleteResult {
     message: String,
@@ -901,15 +1064,11 @@ struct StageDeleteResult {
 fn stage_delete(
     path: &Path,
     display_path: &str,
+    path_source: PathSource,
     tx: &PatchTransaction,
 ) -> Result<StageDeleteResult, PatchError> {
     if !path.exists() {
-        return Err(PatchError::FileNotFound(FileNotFoundData {
-            path: display_path.to_string(),
-            resolved_as: PathSource::Relative,
-            suggestions: Vec::new(),
-            tried_paths: vec![path.display().to_string()],
-        }));
+        return Err(file_not_found_error(display_path, path, path_source));
     }
     // Reject symlinks
     let meta = path.symlink_metadata()?;
@@ -944,17 +1103,13 @@ struct StageUpdateResult {
 fn stage_update(
     path: &Path,
     display_path: &str,
+    path_source: PathSource,
     hunks: &[Hunk],
     tx: &PatchTransaction,
     threshold: Option<f32>,
 ) -> Result<StageUpdateResult, PatchError> {
     if !path.exists() {
-        return Err(PatchError::FileNotFound(FileNotFoundData {
-            path: display_path.to_string(),
-            resolved_as: PathSource::Relative,
-            suggestions: Vec::new(),
-            tried_paths: vec![path.display().to_string()],
-        }));
+        return Err(file_not_found_error(display_path, path, path_source));
     }
     // Reject symlinks
     let meta = path.symlink_metadata()?;
@@ -1627,6 +1782,46 @@ mod tests {
     }
 
     #[test]
+    fn test_write_file_creates_new_file() {
+        let dir = tmp();
+        let ops = vec![FileOp::Write {
+            path: "hello.txt".to_string(),
+            content: "hello\nworld\n".to_string(),
+        }];
+        let result = weave_patch(ops, dir.path());
+        assert_eq!(result.operations[0].status, OpStatus::Ok);
+        assert_eq!(result.operations[0].op_type, "write");
+        assert_eq!(result.operations[0].line_changes, Some((0, 2)));
+        assert_eq!(result.operations[0].path_source, Some(PathSource::Relative));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("hello.txt")).unwrap(),
+            "hello\nworld\n"
+        );
+    }
+
+    #[test]
+    fn test_write_file_overwrites_existing_file() {
+        let dir = tmp();
+        let file_path = dir.path().join("hello.txt");
+        fs::write(&file_path, "old\ncontent\n").unwrap();
+
+        let ops = vec![FileOp::Write {
+            path: "hello.txt".to_string(),
+            content: "new\ncontent\n".to_string(),
+        }];
+        let result = weave_patch(ops, dir.path());
+        assert_eq!(result.operations[0].status, OpStatus::Ok);
+        assert_eq!(result.operations[0].line_changes, Some((2, 2)));
+        assert!(
+            result.operations[0]
+                .diff
+                .as_ref()
+                .is_some_and(|diff| diff.contains("-old") && diff.contains("+new"))
+        );
+        assert_eq!(fs::read_to_string(&file_path).unwrap(), "new\ncontent\n");
+    }
+
+    #[test]
     fn test_delete_file() {
         let dir = tmp();
         let file_path = dir.path().join("target.txt");
@@ -1793,6 +1988,48 @@ mod tests {
             result.operations[0].message.contains("not found")
                 || result.operations[0].message.contains("File not found")
         );
+        assert!(
+            result.operations[0]
+                .message
+                .contains("Resolved as: relative")
+        );
+    }
+
+    #[test]
+    fn test_error_file_not_found_reports_absolute_path_source() {
+        let dir = tmp();
+        let missing_path = dir.path().join("missing_absolute.rs");
+        let ops = vec![FileOp::Update {
+            path: missing_path.display().to_string(),
+            hunks: vec![],
+            move_to: None,
+        }];
+        let result = weave_patch(ops, dir.path());
+        assert_eq!(result.operations[0].status, OpStatus::FatalError);
+        assert!(
+            result.operations[0]
+                .message
+                .contains("Resolved as: absolute")
+        );
+    }
+
+    #[test]
+    fn test_error_file_not_found_suggests_similar_files() {
+        let dir = tmp();
+        fs::write(dir.path().join("config.rs"), "fn config() {}\n").unwrap();
+
+        let ops = vec![FileOp::Update {
+            path: "confg.rs".to_string(),
+            hunks: vec![],
+            move_to: None,
+        }];
+        let result = weave_patch(ops, dir.path());
+        assert_eq!(result.operations[0].status, OpStatus::FatalError);
+        assert!(
+            result.operations[0]
+                .message
+                .contains("Similar files: config.rs")
+        );
     }
 
     #[test]
@@ -1841,6 +2078,39 @@ mod tests {
         assert_eq!(result.operations[0].status, OpStatus::Ok);
         assert!(dir.path().join("new.txt").exists());
         assert!(!existing.exists());
+    }
+
+    #[test]
+    fn test_write_conflicts_with_update_on_same_file() {
+        let dir = tmp();
+        fs::write(dir.path().join("conflict.txt"), "old\n").unwrap();
+
+        let ops = vec![
+            FileOp::Write {
+                path: "conflict.txt".to_string(),
+                content: "new\n".to_string(),
+            },
+            FileOp::Update {
+                path: "conflict.txt".to_string(),
+                hunks: vec![Hunk {
+                    context_hint: None,
+                    lines: vec![
+                        DiffLine::Context("old".to_string()),
+                        DiffLine::Add("newer".to_string()),
+                    ],
+                }],
+                move_to: None,
+            },
+        ];
+
+        let result = weave_patch(ops, dir.path());
+        assert_eq!(result.operations[0].status, OpStatus::FatalError);
+        assert!(
+            result.operations[0]
+                .message
+                .contains("Cannot combine Write with other write operations")
+        );
+        assert_eq!(result.operations[1].status, OpStatus::FatalError);
     }
 
     // F1: Path traversal tests (sandbox removed, paths now allowed)
@@ -2756,10 +3026,11 @@ echo hello
         let result = weave_patch(ops, dir.path());
 
         assert_eq!(result.operations[0].status, OpStatus::FatalError);
+        assert!(result.operations[0].message.contains("File not found"));
         assert!(
             result.operations[0]
                 .message
-                .contains("Source file not found")
+                .contains("Resolved as: relative")
         );
     }
 

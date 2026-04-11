@@ -1,8 +1,8 @@
 # weave-patch-mcp
 
-[![version](https://img.shields.io/badge/version-0.0.3-blue)](https://www.npmjs.com/package/mcp-weave-patch) [![license](https://img.shields.io/badge/license-MIT-green)](https://opensource.org/licenses/MIT) [![platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)](#supported-platforms)
+[![version](https://img.shields.io/badge/version-0.0.15-blue)](https://www.npmjs.com/package/mcp-weave-patch) [![license](https://img.shields.io/badge/license-MIT-green)](https://opensource.org/licenses/MIT) [![platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)](#supported-platforms)
 
-**One tool. Five operations. Zero intermediate states.**
+**One tool. Familiar view/write flows. Zero intermediate states.**
 
 ![Weave Patch MCP Architecture](assets/wpm_viz.jpg)
 
@@ -18,30 +18,35 @@ Context drift makes line numbers stale. Token limits force LLM agents into parti
 
 Every multi-file edit is a gamble. One call fails, and now the agent is debugging intermediate state. Meanwhile, the context window shrinks.
 
-## Why This Over Edit/Write?
+## Why This Over `view` + `apply_patch`?
 
-| | Traditional (Edit + Write) | weave-patch-mcp |
+| | Copilot CLI `view` + `apply_patch` | weave-patch-mcp |
 |---|---|---|
-| **Calls per change** | 1 tool call per file | 1 call for all files |
+| **Read flow** | `view` | `view` alias or `read` |
+| **Whole-file write** | Separate write tool or manual patching | `write` creates or overwrites atomically |
 | **Multi-file atomicity** | No — broken intermediate states | Yes — all-or-nothing |
-| **Context anchoring** | Line numbers (drift after edits) | Pattern matching (survives drift) |
-| **Token cost** | High — full file content per call | Low — only diffs sent |
-| **Reviewer clarity** | Opaque (full file dumps) | Standard diff format |
-| **Scale** | Painful at 5+ files | Handles 100+ files per call |
-| **Error recovery** | Manual retry | Fuzzy matching + structured diagnostics |
+| **Context anchoring** | Line ranges and exact hunks | Pattern matching (survives drift) |
+| **Error recovery** | Re-read and retry manually | Closest matches + structured diagnostics |
+| **Scale** | Many tool calls across files | One call for many files |
+| **Reviewer clarity** | Tool-specific payloads | Standard diffs + per-op summary |
 
 **Atomic patches that survive context drift.** Scale from 1 file to 100+. Same call. Same guarantees.
 
-### Recommended: Disable Traditional Tools
+### Migration from Native File Tools
 
-This MCP tool replaces traditional file operations with unified patch syntax:
-- `Read(*)` → `patch__exec` read operations
-- `Edit(*)` → `patch__exec` update operations  
-- `Write(*)` → `patch__exec` create operations
+This MCP tool can replace native file operations with one patch language:
 
-Configure your MCP client to disable these tools when using patch__exec to prevent conflicts and ensure atomic operations.
+| Native habit | `patch__exec` equivalent |
+|---|---|
+| `view path` | `view path` or `read path` |
+| whole-file write | `write path` |
+| `apply_patch` add file | `create path` or `write path` with `+` lines |
+| `apply_patch` update file | `update path` |
+| delete file | `delete path` |
 
-For best results, deny Edit/Write in MCP client settings so the LLM agent always uses weave-patch:
+`write` is the easiest replacement for a traditional whole-file write tool. `create` stays create-only if you want fail-fast behavior when a file already exists.
+
+For best results, disable overlapping file tools in your MCP client once the agent has migrated to weave-patch:
 
 Add to the client's deny list:
 ```json
@@ -114,17 +119,17 @@ Add to the config:
 
 ## Tool: `patch__exec`
 
-One tool, one parameter (`patch`). Five operations available in a single atomic call.
+One tool, one parameter (`patch`). Supports `view`, `read`, `map`, `create`, `write`, `update`, `move`, and `delete` in a single atomic call.
 
 All patches are wrapped in `=== begin` / `=== end` markers.
 
-### 1. Read a file
+### 1. View or read a file
 
 **Extract just what's needed.** Symbol extraction pulls functions, classes, and structs without reading entire files — token-efficient and surfacing relevant context.
 
 ```
 === begin
-read src/main.rs
+view src/main.rs
 === end
 ```
 
@@ -135,12 +140,14 @@ read src/lib.rs symbols=Server,handle_request language=rust
 === end
 ```
 
-**Read with line range**:
+**View with 1-based line range**:
 ```
 === begin
-read config.py offset=10 limit=50
+view config.py start=11 end=60
 === end
 ```
+
+`offset=` / `limit=` still work. `start=` / `end=` are easier to map from human line numbers.
 
 **Read multiple files** (batch read):
 ```
@@ -163,9 +170,9 @@ map src/ depth=2
 
 Defaults: `depth=3`, `limit=6000` chars.
 
-### 3. Add a file
+### 3. Create a file
 
-**Every file starts with one call.** No switching tools, no context pollution.
+**Fail fast when the file already exists.** Use `create` when you want new-file semantics, and `write` when you want create-or-overwrite semantics.
 
 ```
 === begin
@@ -174,7 +181,20 @@ create src/hello.rs
 === end
 ```
 
-### 4. Update a file
+`create` accepts raw file contents or apply_patch-style `+` lines, so agents used to add-file hunks do not need to relearn the body format.
+
+### 4. Write a file
+
+**Whole-file replace, atomically.** This is the closest migration target for a traditional write tool.
+
+```
+=== begin
+write src/hello.rs
++pub fn hello() { println!("Hello!"); }
+=== end
+```
+
+### 5. Update a file
 
 **Code drifted? We still find it.** Three-phase matching (exact → whitespace-normalized → fuzzy at 85%+) means context drift won't break the patch.
 
@@ -253,7 +273,7 @@ update README.md
 
 If table rows were not recognized, a hunk could end up with only `+` lines; the matcher then has no anchor and **appends at end of file** (usually wrong).
 
-### 5. Delete a file
+### 6. Delete a file
 
 **Clean removal.** One call, file gone. No orphaned references left behind.
 
@@ -295,6 +315,8 @@ Read operations execute first (safe/read-only), then write operations are applie
 ## Key Concepts
 
 - **Atomicity** — All-or-nothing writes. No half-applied refactors. Multi-file patches use two-phase commit with shadow files. If any operation fails, everything rolls back.
+
+- **Migration-friendly syntax** — `view` mirrors native file viewers, `write` mirrors whole-file write tools, and `create` / `write` accept apply_patch-style `+` lines.
 
 - **Fuzzy matching** — Code drifted? We still find it. Three-phase pipeline matches context even after edits.
 
@@ -338,6 +360,7 @@ Every operation returns a structured `OpStatus` enum instead of a string:
 | **Multi-file refactor** | `update` (batch) | One call, 47 files. All-or-nothing. |
 | **Exploring unfamiliar code** | `map` + `read symbols=` | Token-efficient symbol extraction |
 | **Fixing tests across files** | `read` + `update` + `delete` | Combined read/write in one atomic call |
+| **Replacing native file tools** | `view` + `write` + `update` | Familiar flow, fewer tool switches |
 | **Deleting deprecated paths** | `delete` (batch) | Clean removal, no partial states |
 | **Renaming during refactor** | `update` + `move_to` | Rename and edit atomically |
 | **Adding new modules** | `create` (batch) | Create multiple files without tool-switching |

@@ -19,6 +19,10 @@ pub enum FileOp {
         path: String,
         content: String,
     },
+    Write {
+        path: String,
+        content: String,
+    },
     Delete {
         path: String,
     },
@@ -52,18 +56,22 @@ pub struct ParseResult {
     pub threshold: Option<f32>,
 }
 
+fn is_operation_header(line: &str) -> bool {
+    line.starts_with("create ")
+        || line.starts_with("write ")
+        || line.starts_with("update ")
+        || line.starts_with("delete ")
+        || line.starts_with("read ")
+        || line.starts_with("view ")
+        || line.starts_with("map ")
+        || line.starts_with("move ")
+}
+
 pub fn parse_patch(input: &str) -> Result<ParseResult, PatchError> {
     // Auto-wrap missing begin/end markers for forgiving parsing.
     let has_begin = input.lines().any(|l| l.trim().starts_with("=== begin"));
     let has_end = input.lines().any(|l| l.trim() == "=== end");
-    let has_ops = input.lines().any(|l| {
-        l.starts_with("create ")
-            || l.starts_with("update ")
-            || l.starts_with("delete ")
-            || l.starts_with("read ")
-            || l.starts_with("map ")
-            || l.starts_with("move ")
-    });
+    let has_ops = input.lines().any(is_operation_header);
 
     let input = if !has_begin && has_ops {
         format!("=== begin\n{input}")
@@ -112,14 +120,7 @@ pub fn parse_patch(input: &str) -> Result<ParseResult, PatchError> {
     let file_op_indices: Vec<usize> = body_lines
         .iter()
         .enumerate()
-        .filter(|(_, l)| {
-            l.starts_with("create ")
-                || l.starts_with("update ")
-                || l.starts_with("delete ")
-                || l.starts_with("read ")
-                || l.starts_with("map ")
-                || l.starts_with("move ")
-        })
+        .filter(|(_, l)| is_operation_header(l))
         .map(|(i, _)| i)
         .collect();
 
@@ -135,8 +136,12 @@ pub fn parse_patch(input: &str) -> Result<ParseResult, PatchError> {
 
         if let Some(path) = header.strip_prefix("create ") {
             let path = path.trim().to_string();
-            let content = parse_add_content(section);
+            let content = parse_file_content(section);
             ops.push(FileOp::Add { path, content });
+        } else if let Some(path) = header.strip_prefix("write ") {
+            let path = path.trim().to_string();
+            let content = parse_file_content(section);
+            ops.push(FileOp::Write { path, content });
         } else if let Some(path) = header.strip_prefix("delete ") {
             let path = path.trim().to_string();
             ops.push(FileOp::Delete { path });
@@ -148,7 +153,10 @@ pub fn parse_patch(input: &str) -> Result<ParseResult, PatchError> {
                 hunks,
                 move_to,
             });
-        } else if let Some(read_spec) = header.strip_prefix("read ") {
+        } else if let Some(read_spec) = header
+            .strip_prefix("read ")
+            .or_else(|| header.strip_prefix("view "))
+        {
             let spec = parse_read_spec(read_spec);
             ops.push(FileOp::Read {
                 path: spec.path,
@@ -243,18 +251,30 @@ fn parse_move_spec(spec: &str) -> Result<(String, String), PatchError> {
     Ok((parts[0].to_string(), parts[1].to_string()))
 }
 
-fn parse_add_content(lines: &[&str]) -> String {
+fn parse_file_content(lines: &[&str]) -> String {
     // Trim trailing empty lines (artifacts from input ending with \n)
     let lines = match lines.iter().rposition(|l| !l.is_empty()) {
         Some(idx) => &lines[..=idx],
         None => return String::new(),
     };
 
-    if lines.is_empty() {
-        String::new()
-    } else {
-        lines.join("\n") + "\n"
-    }
+    let strip_apply_patch_prefixes = lines
+        .iter()
+        .filter(|line| !line.is_empty())
+        .all(|line| line.starts_with('+'));
+
+    let normalized: Vec<String> = lines
+        .iter()
+        .map(|line| {
+            if strip_apply_patch_prefixes && !line.is_empty() {
+                line.strip_prefix('+').unwrap_or(line).to_string()
+            } else {
+                (*line).to_string()
+            }
+        })
+        .collect();
+
+    normalized.join("\n") + "\n"
 }
 
 /// Parsed read file specification from `read` header.
@@ -266,7 +286,8 @@ pub struct ReadSpec {
     pub limit: Option<usize>,
 }
 
-/// Parse a Read specification: "read <path> [symbols=a,b] [language=rust] [offset=0] [limit=100]"
+/// Parse a Read specification:
+/// "read <path> [symbols=a,b] [language=rust] [offset=0] [limit=100] [start=1] [end=20]"
 fn parse_read_spec(spec: &str) -> ReadSpec {
     // Split by whitespace to separate path from key=value params
     let parts: Vec<&str> = spec.split_whitespace().collect();
@@ -276,6 +297,8 @@ fn parse_read_spec(spec: &str) -> ReadSpec {
     let mut language: Option<String> = None;
     let mut offset: Option<usize> = None;
     let mut limit: Option<usize> = None;
+    let mut start: Option<usize> = None;
+    let mut end: Option<usize> = None;
 
     for part in &parts[1..] {
         if let Some(kv) = part.strip_prefix("symbols=") {
@@ -290,7 +313,32 @@ fn parse_read_spec(spec: &str) -> ReadSpec {
             && let Ok(n) = val.parse::<usize>()
         {
             limit = Some(n);
+        } else if let Some(val) = part.strip_prefix("start=")
+            && let Ok(n) = val.parse::<usize>()
+        {
+            start = Some(n);
+        } else if let Some(val) = part.strip_prefix("end=")
+            && let Ok(n) = val.parse::<usize>()
+        {
+            end = Some(n);
         }
+    }
+
+    if offset.is_none()
+        && let Some(start_line) = start
+    {
+        offset = Some(start_line.saturating_sub(1));
+    }
+
+    if limit.is_none() {
+        limit = match (start, end) {
+            (Some(start_line), Some(end_line)) if end_line >= start_line => {
+                Some(end_line - start_line + 1)
+            }
+            (Some(_), Some(_)) => Some(0),
+            (None, Some(end_line)) => Some(end_line),
+            _ => None,
+        };
     }
 
     ReadSpec {
@@ -428,6 +476,35 @@ mod tests {
                 assert_eq!(content, "fn hello() {\n    println!(\"Hello\");\n}\n");
             }
             _ => panic!("Expected Add"),
+        }
+    }
+
+    #[test]
+    fn test_parse_create_apply_patch_style_body() {
+        let input =
+            "=== begin\ncreate src/hello.rs\n+fn hello() {\n+    println!(\"Hello\");\n+}\n=== end";
+        let result = parse_patch(input).unwrap();
+        match &result.ops[0] {
+            FileOp::Add { path, content } => {
+                assert_eq!(path, "src/hello.rs");
+                assert_eq!(content, "fn hello() {\n    println!(\"Hello\");\n}\n");
+            }
+            _ => panic!("Expected Add"),
+        }
+    }
+
+    #[test]
+    fn test_parse_write_file() {
+        let input =
+            "=== begin\nwrite src/hello.rs\n+fn hello() {\n+    println!(\"Hello\");\n+}\n=== end";
+        let result = parse_patch(input).unwrap();
+        assert_eq!(result.ops.len(), 1);
+        match &result.ops[0] {
+            FileOp::Write { path, content } => {
+                assert_eq!(path, "src/hello.rs");
+                assert_eq!(content, "fn hello() {\n    println!(\"Hello\");\n}\n");
+            }
+            _ => panic!("Expected Write"),
         }
     }
 
@@ -623,6 +700,25 @@ mod tests {
                 assert_eq!(path, "config.py");
                 assert_eq!(offset, &Some(10));
                 assert_eq!(limit, &Some(50));
+            }
+            _ => panic!("Expected Read"),
+        }
+    }
+
+    #[test]
+    fn test_parse_view_alias_with_start_end() {
+        let input = "=== begin\nview config.py start=11 end=20\n=== end";
+        let result = parse_patch(input).unwrap();
+        match &result.ops[0] {
+            FileOp::Read {
+                path,
+                offset,
+                limit,
+                ..
+            } => {
+                assert_eq!(path, "config.py");
+                assert_eq!(offset, &Some(10));
+                assert_eq!(limit, &Some(10));
             }
             _ => panic!("Expected Read"),
         }
