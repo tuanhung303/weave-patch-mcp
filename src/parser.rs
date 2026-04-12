@@ -56,6 +56,53 @@ pub struct ParseResult {
     pub threshold: Option<f32>,
 }
 
+fn normalize_patch_input(input: &str) -> Result<String, PatchError> {
+    if input.lines().any(|line| line.trim() == "*** Begin Patch") {
+        preprocess_apply_patch_text(input)
+    } else {
+        Ok(input.to_string())
+    }
+}
+
+fn preprocess_apply_patch_text(input: &str) -> Result<String, PatchError> {
+    let lines: Vec<&str> = input.lines().collect();
+
+    let begin_idx = lines
+        .iter()
+        .position(|line| line.trim() == "*** Begin Patch")
+        .ok_or_else(|| PatchError::Parse("Missing '*** Begin Patch' marker".to_string()))?;
+    let end_idx = lines
+        .iter()
+        .rposition(|line| line.trim() == "*** End Patch")
+        .ok_or_else(|| PatchError::Parse("Missing '*** End Patch' marker".to_string()))?;
+
+    if end_idx <= begin_idx {
+        return Err(PatchError::Parse(
+            "'*** End Patch' must come after '*** Begin Patch'".to_string(),
+        ));
+    }
+
+    let mut normalized = vec!["=== begin".to_string()];
+
+    for line in &lines[begin_idx + 1..end_idx] {
+        let trimmed = line.trim();
+        if let Some(path) = trimmed.strip_prefix("*** Add File: ") {
+            normalized.push(format!("create {}", path.trim()));
+        } else if let Some(path) = trimmed.strip_prefix("*** Delete File: ") {
+            normalized.push(format!("delete {}", path.trim()));
+        } else if let Some(path) = trimmed.strip_prefix("*** Update File: ") {
+            normalized.push(format!("update {}", path.trim()));
+        } else if let Some(path) = trimmed.strip_prefix("*** Move to: ") {
+            normalized.push(format!("move_to {}", path.trim()));
+        } else {
+            normalized.push((*line).to_string());
+        }
+    }
+
+    normalized.push("=== end".to_string());
+    Ok(normalized.join("\n"))
+}
+
 fn is_operation_header(line: &str) -> bool {
     line.starts_with("create ")
         || line.starts_with("write ")
@@ -68,6 +115,8 @@ fn is_operation_header(line: &str) -> bool {
 }
 
 pub fn parse_patch(input: &str) -> Result<ParseResult, PatchError> {
+    let input = normalize_patch_input(input)?;
+
     // Auto-wrap missing begin/end markers for forgiving parsing.
     let has_begin = input.lines().any(|l| l.trim().starts_with("=== begin"));
     let has_end = input.lines().any(|l| l.trim() == "=== end");
@@ -76,7 +125,7 @@ pub fn parse_patch(input: &str) -> Result<ParseResult, PatchError> {
     let input = if !has_begin && has_ops {
         format!("=== begin\n{input}")
     } else {
-        input.to_string()
+        input
     };
     let input = if !has_end {
         format!("{input}\n=== end")
@@ -505,6 +554,60 @@ mod tests {
                 assert_eq!(content, "fn hello() {\n    println!(\"Hello\");\n}\n");
             }
             _ => panic!("Expected Write"),
+        }
+    }
+
+    #[test]
+    fn test_parse_apply_patch_add_file_block() {
+        let input = "*** Begin Patch\n*** Add File: src/hello.rs\n+fn hello() {\n+    println!(\"Hello\");\n+}\n*** End Patch";
+        let result = parse_patch(input).unwrap();
+        assert_eq!(result.ops.len(), 1);
+        match &result.ops[0] {
+            FileOp::Add { path, content } => {
+                assert_eq!(path, "src/hello.rs");
+                assert_eq!(content, "fn hello() {\n    println!(\"Hello\");\n}\n");
+            }
+            _ => panic!("Expected Add"),
+        }
+    }
+
+    #[test]
+    fn test_parse_apply_patch_update_with_move_to() {
+        let input = "*** Begin Patch\n*** Update File: src/old.rs\n*** Move to: src/new.rs\n@@\n fn hello() {\n-    old();\n+    new();\n }\n*** End Patch";
+        let result = parse_patch(input).unwrap();
+        assert_eq!(result.ops.len(), 1);
+        match &result.ops[0] {
+            FileOp::Update {
+                path,
+                hunks,
+                move_to,
+            } => {
+                assert_eq!(path, "src/old.rs");
+                assert_eq!(move_to.as_deref(), Some("src/new.rs"));
+                assert_eq!(hunks.len(), 1);
+                assert_eq!(
+                    hunks[0].lines[0],
+                    DiffLine::Context("fn hello() {".to_string())
+                );
+                assert_eq!(
+                    hunks[0].lines[1],
+                    DiffLine::Remove("    old();".to_string())
+                );
+                assert_eq!(hunks[0].lines[2], DiffLine::Add("    new();".to_string()));
+                assert_eq!(hunks[0].lines[3], DiffLine::Context("}".to_string()));
+            }
+            _ => panic!("Expected Update"),
+        }
+    }
+
+    #[test]
+    fn test_parse_apply_patch_delete_file_block() {
+        let input = "*** Begin Patch\n*** Delete File: src/old.rs\n*** End Patch";
+        let result = parse_patch(input).unwrap();
+        assert_eq!(result.ops.len(), 1);
+        match &result.ops[0] {
+            FileOp::Delete { path } => assert_eq!(path, "src/old.rs"),
+            _ => panic!("Expected Delete"),
         }
     }
 

@@ -1,0 +1,119 @@
+Unified workspace tool for agents moving from Copilot CLI `view` + `apply_patch`: `view`/`read`, `map`, `create`, `write`, `update`, `move`, and `delete` in one atomic call.
+Version: 0.0.16
+
+FORMAT: use weave syntax wrapped in === begin / === end, or paste native apply_patch blocks directly.
+
+FAMILIAR ALIASES:
+  - view <path> ...      alias for read
+  - write <path> ...     create or overwrite a whole file atomically
+  - create/write bodies  accept raw text or apply_patch-style + lines
+  - *** Begin Patch ...  accepted directly
+
+EXAMPLES:
+
+View a file:
+
+```text
+=== begin
+view src/main.rs
+=== end
+```
+
+View with 1-based line range:
+
+```text
+=== begin
+view src/lib.rs start=11 end=40
+=== end
+```
+
+Read with symbols:
+
+```text
+=== begin
+read src/lib.rs symbols=Server,handle_request language=rust
+=== end
+```
+
+Write a file (create or overwrite):
+
+```text
+=== begin
+write src/hello.rs
++pub fn hello() { println!("Hello!"); }
+=== end
+```
+
+Update a file:
+
+```text
+=== begin
+update src/lib.rs
+@@ fn main
+ fn main() {
+-    old_code();
++    new_code();
+ }
+=== end
+```
+
+Native apply_patch block:
+
+```diff
+*** Begin Patch
+*** Update File: src/lib.rs
+@@
+ fn main() {
+-    old_code();
++    new_code();
+ }
+*** End Patch
+```
+
+Move a file:
+
+```text
+=== begin
+move src/old.rs src/new.rs
+=== end
+```
+
+Combined operations:
+
+```text
+=== begin
+view src/main.rs
+update src/lib.rs
+@@ fn main
+ fn main() {
+-    old();
++    new();
+ }
+write src/greet.rs
++pub fn greet() { println!("hi"); }
+delete src/deprecated.rs
+=== end
+```
+
+PATCH BODY OPTIONS:
+  view|read <path> [symbols=a,b] [language=rust] [offset=N] [limit=N] [start=N] [end=N]
+  map <path> [depth=N] [limit=N]
+  create <path>   content lines (create only; raw text or all + lines)
+  write <path>    content lines (create or overwrite; raw text or all + lines)
+  update <path>   @@ hint (optional)   context/ -/ + lines
+  delete <path>
+  move <from> <to>
+  move_to <path>  (inside Update)
+
+TOOL PARAMETERS:
+  - dry_run=true previews the batch without committing filesystem changes
+  - response_format=json returns a machine-readable JSON payload in the tool text response
+
+DEFAULTS:
+  - Fuzzy matching threshold: 0.97
+  - Map depth: 3, output limit: 6000 chars
+  - File read truncation: 1000 lines unless symbols/limit/start-end specified
+
+SECURITY: No symlinks. Relative paths (including ../), absolute paths, and ~ home expansion are allowed.
+
+VALIDATORS (advisory): rustfmt, py_compile, gofmt, json.tool, bash -n, node --check, terraform fmt

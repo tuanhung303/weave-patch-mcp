@@ -1120,3 +1120,50 @@ fn test_markdown_table_pipe_remove_add() {
     assert!(content.contains("| New | v2 |"), "got:\n{content}");
     assert!(!content.contains("| Old | v1 |"), "got:\n{content}");
 }
+
+/// End-to-end: native apply_patch blocks should still get weave's atomic multi-file behavior.
+#[test]
+fn test_apply_patch_block_multi_file_rename_add_delete() {
+    let dir = tmp();
+    fs::write(
+        dir.path().join("legacy.rs"),
+        "fn process() {\n    old_call();\n}\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join("stale.txt"), "remove me\n").unwrap();
+
+    let input = concat!(
+        "*** Begin Patch\n",
+        "*** Update File: legacy.rs\n",
+        "*** Move to: src/modern.rs\n",
+        "@@\n",
+        " fn process() {\n",
+        "-    old_call();\n",
+        "+    new_call();\n",
+        " }\n",
+        "*** Add File: notes.md\n",
+        "+# Migration\n",
+        "+done\n",
+        "*** Delete File: stale.txt\n",
+        "*** End Patch",
+    );
+
+    let ops = parse_patch(input).unwrap().ops;
+    let result = weave_patch(ops, dir.path());
+
+    assert_eq!(result.operations.len(), 3, "got: {:?}", result.operations);
+    assert_eq!(result.operations[0].status, OpStatus::Ok);
+    assert_eq!(result.operations[1].status, OpStatus::Ok);
+    assert_eq!(result.operations[2].status, OpStatus::Ok);
+
+    assert!(!dir.path().join("legacy.rs").exists());
+    assert_eq!(
+        fs::read_to_string(dir.path().join("src/modern.rs")).unwrap(),
+        "fn process() {\n    new_call();\n}\n"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("notes.md")).unwrap(),
+        "# Migration\ndone\n"
+    );
+    assert!(!dir.path().join("stale.txt").exists());
+}

@@ -1,6 +1,6 @@
 # weave-patch-mcp
 
-[![version](https://img.shields.io/badge/version-0.0.15-blue)](https://www.npmjs.com/package/mcp-weave-patch) [![license](https://img.shields.io/badge/license-MIT-green)](https://opensource.org/licenses/MIT) [![platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)](#supported-platforms)
+[![version](https://img.shields.io/badge/version-0.0.16-blue)](https://www.npmjs.com/package/mcp-weave-patch) [![license](https://img.shields.io/badge/license-MIT-green)](https://opensource.org/licenses/MIT) [![platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)](#supported-platforms)
 
 **One tool. Familiar view/write flows. Zero intermediate states.**
 
@@ -42,9 +42,12 @@ This MCP tool can replace native file operations with one patch language:
 | whole-file write | `write path` |
 | `apply_patch` add file | `create path` or `write path` with `+` lines |
 | `apply_patch` update file | `update path` |
+| full `apply_patch` block | paste it directly; weave translates it |
 | delete file | `delete path` |
 
 `write` is the easiest replacement for a traditional whole-file write tool. `create` stays create-only if you want fail-fast behavior when a file already exists.
+
+If you already have a native `*** Begin Patch` block, you can paste it directly into `patch__exec` without translating it first.
 
 For best results, disable overlapping file tools in your MCP client once the agent has migrated to weave-patch:
 
@@ -119,9 +122,16 @@ Add to the config:
 
 ## Tool: `patch__exec`
 
-One tool, one parameter (`patch`). Supports `view`, `read`, `map`, `create`, `write`, `update`, `move`, and `delete` in a single atomic call.
+One tool with a required `patch` body and optional `threshold`, `dry_run`, and `response_format` params. Supports `view`, `read`, `map`, `create`, `write`, `update`, `move`, and `delete` in a single atomic call.
 
-All patches are wrapped in `=== begin` / `=== end` markers.
+Use weave syntax wrapped in `=== begin` / `=== end`, or paste native `*** Begin Patch` blocks directly.
+
+Batches execute in authored order against a staged workspace view. That means `write` then `read` sees staged content immediately, while the final filesystem commit still stays atomic.
+
+**Agent controls**
+
+- `dry_run=true` previews the batch without committing filesystem changes.
+- `response_format=json` returns a machine-readable JSON summary with per-op results.
 
 ### 1. View or read a file
 
@@ -168,7 +178,7 @@ map src/ depth=2
 === end
 ```
 
-Defaults: `depth=3`, `limit=6000` chars.
+Defaults: `depth=3`, `limit=6000` chars. File reads truncate at `1000` lines unless you pass `limit`, `symbols`, or `start` / `end`.
 
 ### 3. Create a file
 
@@ -213,6 +223,19 @@ update src/lib.rs
 +    self.new_handler(req)
  }
 === end
+```
+
+**Already have an `apply_patch` block?** Paste it directly:
+
+```diff
+*** Begin Patch
+*** Update File: src/lib.rs
+@@
+ fn main() {
+-    old();
++    new();
+ }
+*** End Patch
 ```
 
 **Multiple hunks in one file**:
@@ -310,7 +333,7 @@ delete src/deprecated.rs
 === end
 ```
 
-Read operations execute first (safe/read-only), then write operations are applied atomically.
+Operations execute in authored order against staged state, then all writes commit atomically at the end.
 
 ## Key Concepts
 

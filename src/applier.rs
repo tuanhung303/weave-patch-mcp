@@ -1,8 +1,4 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-
-use parking_lot::Mutex;
-use rayon::prelude::*;
 
 use crate::error::{ClosestMatch, ContextNotFoundData, FileNotFoundData, PatchError};
 use crate::parser::{DiffLine, FileOp, Hunk};
@@ -86,6 +82,8 @@ pub struct OpResult {
     /// For partial batch failures: why this successful op was rolled back.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rollback_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -100,7 +98,7 @@ pub struct PatchResult {
 }
 
 #[must_use]
-fn make_op(
+pub(crate) fn make_op(
     path: &str,
     op_type: &str,
     status: OpStatus,
@@ -121,78 +119,166 @@ fn make_op(
         batch_index: batch.map(|(idx, _)| idx),
         batch_total: batch.map(|(_, total)| total),
         rollback_reason: None,
+        output: None,
     }
 }
 
 #[must_use]
-fn with_path_source(mut op: OpResult, path_source: PathSource) -> OpResult {
+pub(crate) fn with_path_source(mut op: OpResult, path_source: PathSource) -> OpResult {
     op.path_source = Some(path_source);
     op
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VirtualPathKind {
+    Missing,
+    File,
+    Directory,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct VirtualDirEntry {
+    pub name: String,
+    pub path: PathBuf,
+    pub is_dir: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct VirtualRead {
+    pub bytes: Vec<u8>,
+    pub path_source: PathSource,
+    pub staged: bool,
+}
+
 /// Two-phase commit: stages shadow files, commits atomically, rolls back on Drop if not committed.
 struct PatchTransaction {
-    staged_files: Arc<Mutex<Vec<(PathBuf, PathBuf)>>>, // (shadow_path, target_path)
-    deletions: Arc<Mutex<Vec<PathBuf>>>,
-    committed: Arc<Mutex<bool>>,
-    backup_files: Arc<Mutex<Vec<(PathBuf, PathBuf)>>>, // (backup_path, target_path)
+    staged_files: Vec<(PathBuf, PathBuf)>, // (shadow_path, target_path)
+    deletions: Vec<PathBuf>,
+    committed: bool,
+    backup_files: Vec<(PathBuf, PathBuf)>, // (backup_path, target_path)
 }
 
 impl PatchTransaction {
     fn new() -> Self {
         Self {
-            staged_files: Arc::new(Mutex::new(Vec::new())),
-            deletions: Arc::new(Mutex::new(Vec::new())),
-            committed: Arc::new(Mutex::new(false)),
-            backup_files: Arc::new(Mutex::new(Vec::new())),
+            staged_files: Vec::new(),
+            deletions: Vec::new(),
+            committed: false,
+            backup_files: Vec::new(),
         }
     }
 
-    fn stage(&self, shadow: PathBuf, target: PathBuf) {
-        self.staged_files.lock().push((shadow, target));
+    fn stage(&mut self, shadow: PathBuf, target: PathBuf) {
+        if let Some(idx) = self
+            .staged_files
+            .iter()
+            .position(|(_, existing_target)| *existing_target == target)
+        {
+            let (old_shadow, _) = self.staged_files.remove(idx);
+            let _ = std::fs::remove_file(old_shadow);
+        }
+        self.deletions.retain(|existing| existing != &target);
+        self.staged_files.push((shadow, target));
     }
 
-    fn queue_deletion(&self, path: PathBuf) {
-        self.deletions.lock().push(path);
+    fn queue_deletion(&mut self, path: PathBuf) {
+        if let Some(idx) = self
+            .staged_files
+            .iter()
+            .position(|(_, existing_target)| *existing_target == path)
+        {
+            let (shadow, _) = self.staged_files.remove(idx);
+            let _ = std::fs::remove_file(shadow);
+        }
+
+        if !self.deletions.iter().any(|existing| existing == &path) {
+            self.deletions.push(path);
+        }
     }
 
-    fn commit(self) -> Result<(), std::io::Error> {
-        // Lock all the mutexes once at the start
-        let staged = self.staged_files.lock();
-        let deletions = self.deletions.lock();
-        let mut committed = self.committed.lock();
-        let mut backup_files = self.backup_files.lock();
+    fn retarget_shadow(&mut self, shadow_path: &Path, new_target: PathBuf) {
+        if let Some(idx) =
+            self.staged_files
+                .iter()
+                .position(|(existing_shadow, existing_target)| {
+                    existing_shadow.as_path() != shadow_path && *existing_target == new_target
+                })
+        {
+            let (shadow, _) = self.staged_files.remove(idx);
+            let _ = std::fs::remove_file(shadow);
+        }
 
+        self.deletions.retain(|existing| existing != &new_target);
+
+        if let Some((_, target)) = self
+            .staged_files
+            .iter_mut()
+            .find(|(existing_shadow, _)| existing_shadow.as_path() == shadow_path)
+        {
+            *target = new_target;
+        }
+    }
+
+    fn staged_shadow_for(&self, target: &Path) -> Option<PathBuf> {
+        self.staged_files
+            .iter()
+            .find_map(|(shadow, existing_target)| {
+                (existing_target == target).then(|| shadow.clone())
+            })
+    }
+
+    fn has_staged_descendant(&self, dir_path: &Path) -> bool {
+        self.staged_files.iter().any(|(_, target)| {
+            target != dir_path
+                && target.starts_with(dir_path)
+                && target
+                    .strip_prefix(dir_path)
+                    .ok()
+                    .is_some_and(|relative| relative.components().next().is_some())
+        })
+    }
+
+    fn is_deleted(&self, path: &Path) -> bool {
+        self.deletions.iter().any(|deleted| deleted == path)
+    }
+
+    fn snapshot(&self) -> (Vec<(PathBuf, PathBuf)>, Vec<PathBuf>) {
+        (self.staged_files.clone(), self.deletions.clone())
+    }
+
+    fn commit(mut self) -> Result<(), std::io::Error> {
         // Phase 1: Backup existing targets before rename so we can rollback on partial failure
-        for (_, target) in &*staged {
+        for (_, target) in &self.staged_files {
             if target.exists() {
                 let backup = backup_path_for(target);
                 std::fs::copy(target, &backup)?;
-                backup_files.push((backup, target.clone()));
+                self.backup_files.push((backup, target.clone()));
             }
         }
 
         // Phase 2: Rename shadows → targets; rollback on any failure
         let mut renamed: Vec<PathBuf> = Vec::new();
-        for (shadow, target) in &*staged {
+        for (shadow, target) in &self.staged_files {
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             if let Err(e) = std::fs::rename(shadow, target) {
                 // Restore already-renamed targets from backup
                 for done_target in &renamed {
-                    if let Some((backup, _)) = backup_files.iter().find(|(_, t)| t == done_target) {
+                    if let Some((backup, _)) =
+                        self.backup_files.iter().find(|(_, t)| t == done_target)
+                    {
                         let _ = std::fs::rename(backup, done_target);
                     }
                 }
                 // Clean up remaining shadow files
-                for (s, t) in &*staged {
+                for (s, t) in &self.staged_files {
                     if !renamed.contains(t) {
                         let _ = std::fs::remove_file(s);
                     }
                 }
                 // Clean up all backup files
-                for (backup, _) in &*backup_files {
+                for (backup, _) in &self.backup_files {
                     let _ = std::fs::remove_file(backup);
                 }
                 return Err(e);
@@ -201,31 +287,131 @@ impl PatchTransaction {
         }
 
         // Phase 3: Success — execute deletions and clean up backup files
-        for (backup, _) in &*backup_files {
+        for (backup, _) in &self.backup_files {
             let _ = std::fs::remove_file(backup);
         }
-        for path in &*deletions {
-            std::fs::remove_file(path)?;
+        for path in &self.deletions {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
         }
-        *committed = true;
+        self.committed = true;
         Ok(())
     }
 }
 
 impl Drop for PatchTransaction {
     fn drop(&mut self) {
-        let committed = *self.committed.lock();
-        if !committed {
-            let staged = self.staged_files.lock();
-            for (shadow, _) in &*staged {
+        if !self.committed {
+            for (shadow, _) in &self.staged_files {
                 let _ = std::fs::remove_file(shadow);
             }
             // Clean up any leftover backup files
-            let backup_files = self.backup_files.lock();
-            for (backup, _) in &*backup_files {
+            for (backup, _) in &self.backup_files {
                 let _ = std::fs::remove_file(backup);
             }
         }
+    }
+}
+
+pub(crate) struct PatchSession {
+    base_dir: PathBuf,
+    threshold: Option<f32>,
+    transaction: PatchTransaction,
+}
+
+impl PatchSession {
+    #[must_use]
+    pub(crate) fn new(base_dir: &Path, threshold: Option<f32>) -> Self {
+        Self {
+            base_dir: base_dir.to_path_buf(),
+            threshold,
+            transaction: PatchTransaction::new(),
+        }
+    }
+
+    pub(crate) fn stage_op(&mut self, op: FileOp, batch: Option<(usize, usize)>) -> OpResult {
+        prepare_op(
+            op,
+            &self.base_dir,
+            &mut self.transaction,
+            self.threshold,
+            batch,
+        )
+    }
+
+    pub(crate) fn commit(self) -> Result<(), std::io::Error> {
+        self.transaction.commit()
+    }
+
+    pub(crate) fn resolve_path(&self, path: &str) -> ResolvedPath {
+        resolve_path(&self.base_dir, path)
+    }
+
+    pub(crate) fn resolve_virtual_kind(
+        &self,
+        display_path: &str,
+    ) -> Result<(ResolvedPath, VirtualPathKind), PatchError> {
+        let resolved = self.resolve_path(display_path);
+        let kind = virtual_path_kind_for_user(
+            &resolved.full_path,
+            display_path,
+            resolved.source,
+            &self.transaction,
+        )?;
+        Ok((resolved, kind))
+    }
+
+    pub(crate) fn read_virtual_file(&self, display_path: &str) -> Result<VirtualRead, PatchError> {
+        let resolved = self.resolve_path(display_path);
+        let kind = virtual_path_kind_for_user(
+            &resolved.full_path,
+            display_path,
+            resolved.source,
+            &self.transaction,
+        )?;
+        match kind {
+            VirtualPathKind::Missing => Err(file_not_found_error(
+                display_path,
+                &resolved.full_path,
+                resolved.source,
+            )),
+            VirtualPathKind::Directory => Err(PatchError::Io(std::io::Error::other(
+                "read target is a directory",
+            ))),
+            VirtualPathKind::File => {
+                let (bytes, staged) = read_virtual_bytes(
+                    &resolved.full_path,
+                    display_path,
+                    resolved.source,
+                    &self.transaction,
+                )?
+                .ok_or_else(|| {
+                    file_not_found_error(display_path, &resolved.full_path, resolved.source)
+                })?;
+                Ok(VirtualRead {
+                    bytes,
+                    path_source: resolved.source,
+                    staged,
+                })
+            }
+        }
+    }
+
+    pub(crate) fn read_virtual_bytes_at(
+        &self,
+        path: &Path,
+    ) -> Result<Option<(Vec<u8>, bool)>, std::io::Error> {
+        read_virtual_bytes_for_map(path, &self.transaction)
+    }
+
+    pub(crate) fn list_virtual_dir(
+        &self,
+        dir_path: &Path,
+    ) -> Result<Vec<VirtualDirEntry>, std::io::Error> {
+        list_virtual_dir(dir_path, &self.transaction)
     }
 }
 
@@ -239,45 +425,240 @@ fn shadow_suffix() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-/// Detect conflicting write operations that target the same path.
-fn detect_file_conflicts(ops: &[FileOp]) -> Result<(), (String, String)> {
-    use std::collections::HashMap;
-    let mut path_ops: HashMap<String, Vec<&str>> = HashMap::new();
+fn is_internal_temp_path(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    name.ends_with(".patch_tmp") || name.ends_with(".backup_tmp")
+}
 
-    for op in ops {
-        let (path, op_type) = match op {
-            FileOp::Add { path, .. } => (path.as_str(), "add"),
-            FileOp::Write { path, .. } => (path.as_str(), "write"),
-            FileOp::Update { path, .. } => (path.as_str(), "update"),
-            FileOp::Delete { path } => (path.as_str(), "delete"),
-            FileOp::Read { .. } | FileOp::Map { .. } => continue,
-            FileOp::Move { from, .. } => (from.as_str(), "move"),
-        };
-        path_ops.entry(path.to_string()).or_default().push(op_type);
+fn read_virtual_bytes(
+    path: &Path,
+    display_path: &str,
+    path_source: PathSource,
+    tx: &PatchTransaction,
+) -> Result<Option<(Vec<u8>, bool)>, PatchError> {
+    if tx.is_deleted(path) {
+        return Ok(None);
     }
 
-    for (path, ops_list) in &path_ops {
-        let has_add = ops_list.contains(&"add");
-        let has_update = ops_list.contains(&"update");
-        let write_count = ops_list.iter().filter(|&&op| op == "write").count();
+    if let Some(shadow) = tx.staged_shadow_for(path) {
+        return std::fs::read(&shadow)
+            .map(|bytes| Some((bytes, true)))
+            .map_err(PatchError::Io);
+    }
 
-        if has_add && has_update {
-            return Err((
-                path.clone(),
-                "Cannot Add and Update the same file in one patch".to_string(),
-            ));
-        }
+    if !path.exists() {
+        return Ok(None);
+    }
 
-        if write_count > 0 && ops_list.len() > 1 {
-            return Err((
-                path.clone(),
-                "Cannot combine Write with other write operations on the same file in one patch"
-                    .to_string(),
-            ));
+    let meta = path.symlink_metadata()?;
+    if meta.file_type().is_symlink() {
+        return Err(PatchError::SymlinkRejected(display_path.to_string()));
+    }
+    if !meta.is_file() {
+        return Err(PatchError::Io(std::io::Error::other(format!(
+            "Path '{}' resolved as {} is not a regular file",
+            display_path, path_source
+        ))));
+    }
+
+    std::fs::read(path)
+        .map(|bytes| Some((bytes, false)))
+        .map_err(PatchError::Io)
+}
+
+fn read_virtual_bytes_for_map(
+    path: &Path,
+    tx: &PatchTransaction,
+) -> Result<Option<(Vec<u8>, bool)>, std::io::Error> {
+    if tx.is_deleted(path) {
+        return Ok(None);
+    }
+
+    if let Some(shadow) = tx.staged_shadow_for(path) {
+        return std::fs::read(&shadow).map(|bytes| Some((bytes, true)));
+    }
+
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let meta = path.symlink_metadata()?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Ok(None);
+    }
+
+    std::fs::read(path).map(|bytes| Some((bytes, false)))
+}
+
+fn read_virtual_text(
+    path: &Path,
+    display_path: &str,
+    path_source: PathSource,
+    tx: &PatchTransaction,
+) -> Result<Option<(String, bool)>, PatchError> {
+    read_virtual_bytes(path, display_path, path_source, tx)?
+        .map(|(bytes, staged)| {
+            String::from_utf8(bytes)
+                .map(|content| (content.replace("\r\n", "\n").replace('\r', "\n"), staged))
+                .map_err(|e| {
+                    PatchError::Io(std::io::Error::other(format!("UTF-8 decode error: {e}")))
+                })
+        })
+        .transpose()
+}
+
+fn virtual_path_kind_for_user(
+    path: &Path,
+    display_path: &str,
+    path_source: PathSource,
+    tx: &PatchTransaction,
+) -> Result<VirtualPathKind, PatchError> {
+    if tx.is_deleted(path) {
+        return Ok(VirtualPathKind::Missing);
+    }
+
+    if tx.staged_shadow_for(path).is_some() {
+        return Ok(VirtualPathKind::File);
+    }
+
+    if tx.has_staged_descendant(path) {
+        return Ok(VirtualPathKind::Directory);
+    }
+
+    if !path.exists() {
+        return Ok(VirtualPathKind::Missing);
+    }
+
+    let meta = path.symlink_metadata()?;
+    if meta.file_type().is_symlink() {
+        return Err(PatchError::SymlinkRejected(display_path.to_string()));
+    }
+    if meta.is_dir() {
+        return Ok(VirtualPathKind::Directory);
+    }
+    if meta.is_file() {
+        return Ok(VirtualPathKind::File);
+    }
+
+    Err(PatchError::Io(std::io::Error::other(format!(
+        "Path '{}' resolved as {} is not a regular file or directory",
+        display_path, path_source
+    ))))
+}
+
+fn list_virtual_dir(
+    dir_path: &Path,
+    tx: &PatchTransaction,
+) -> Result<Vec<VirtualDirEntry>, std::io::Error> {
+    use std::collections::BTreeMap;
+
+    let mut entries: BTreeMap<String, VirtualDirEntry> = BTreeMap::new();
+
+    if dir_path.exists() {
+        for entry in std::fs::read_dir(dir_path)? {
+            let entry = entry?;
+            let path = entry.path();
+
+            if is_internal_temp_path(&path) {
+                continue;
+            }
+
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() {
+                continue;
+            }
+
+            let name = entry.file_name().to_string_lossy().to_string();
+            entries.insert(
+                name.clone(),
+                VirtualDirEntry {
+                    name,
+                    path,
+                    is_dir: file_type.is_dir(),
+                },
+            );
         }
     }
 
-    Ok(())
+    let (staged, deletions) = tx.snapshot();
+
+    for deleted in deletions {
+        if let Ok(relative) = deleted.strip_prefix(dir_path) {
+            let mut components = relative.components();
+            if components.next().is_some()
+                && components.next().is_none()
+                && let Some(name) = deleted.file_name().and_then(|name| name.to_str())
+            {
+                entries.remove(name);
+            }
+        }
+    }
+
+    for (_, target) in staged {
+        if let Ok(relative) = target.strip_prefix(dir_path) {
+            let mut components = relative.components();
+            let Some(first) = components.next() else {
+                continue;
+            };
+            let name = first.as_os_str().to_string_lossy().to_string();
+            let is_dir = components.next().is_some();
+            let entry_path = dir_path.join(&name);
+
+            entries.insert(
+                name.clone(),
+                VirtualDirEntry {
+                    name,
+                    path: entry_path,
+                    is_dir,
+                },
+            );
+        }
+    }
+
+    Ok(entries.into_values().collect())
+}
+
+fn op_kind(op: &FileOp) -> (&str, &str) {
+    match op {
+        FileOp::Add { path, .. } => ("add", path),
+        FileOp::Write { path, .. } => ("write", path),
+        FileOp::Delete { path } => ("delete", path),
+        FileOp::Update { path, .. } => ("update", path),
+        FileOp::Read { path, .. } => ("read", path),
+        FileOp::Map { path, .. } => ("map", path),
+        FileOp::Move { from, .. } => ("move", from),
+    }
+}
+
+fn is_mutating_op(op: &FileOp) -> bool {
+    !matches!(op, FileOp::Read { .. } | FileOp::Map { .. })
+}
+
+fn is_mutating_result(op: &OpResult) -> bool {
+    matches!(
+        op.op_type.as_str(),
+        "add" | "write" | "delete" | "update" | "move"
+    )
+}
+
+fn make_skipped_op_from_file_op(
+    op: &FileOp,
+    message: &str,
+    batch: Option<(usize, usize)>,
+) -> OpResult {
+    let (op_type, path) = op_kind(op);
+    let mut result = make_op(
+        path,
+        op_type,
+        OpStatus::Skipped,
+        "Skipped due to earlier batch failure",
+        batch,
+    );
+    result.rollback_reason = Some(message.to_string());
+    result
 }
 
 #[must_use]
@@ -297,105 +678,42 @@ pub fn weave_patch_with_threshold(
     base_dir: &Path,
     threshold: Option<f32>,
 ) -> PatchResult {
-    // Step 1: Detect conflicts before any I/O
-    if let Err((conflict_path, conflict_msg)) = detect_file_conflicts(&ops) {
-        // Return error for the conflicting operation
-        let total = ops.len();
-        let results: Vec<OpResult> = ops
-            .iter()
-            .enumerate()
-            .map(|(i, op)| {
-                let op_type = match op {
-                    FileOp::Add { .. } => "add",
-                    FileOp::Write { .. } => "write",
-                    FileOp::Update { .. } => "update",
-                    FileOp::Delete { .. } => "delete",
-                    FileOp::Read { .. } => "read",
-                    FileOp::Map { .. } => "map",
-                    FileOp::Move { .. } => "move",
-                };
-                let op_path = match op {
-                    FileOp::Add { path, .. } => path,
-                    FileOp::Write { path, .. } => path,
-                    FileOp::Update { path, .. } => path,
-                    FileOp::Delete { path } => path,
-                    FileOp::Read { path, .. } => path,
-                    FileOp::Map { path, .. } => path,
-                    FileOp::Move { from, .. } => from,
-                };
-                if op_path == &conflict_path {
-                    make_op(
-                        op_path,
-                        op_type,
-                        OpStatus::FatalError,
-                        &conflict_msg,
-                        Some((i + 1, total)),
-                    )
-                } else {
-                    let mut result = make_op(
-                        op_path,
-                        op_type,
-                        OpStatus::Skipped,
-                        "Skipped due to conflict",
-                        Some((i + 1, total)),
-                    );
-                    result.rollback_reason = Some(format!(
-                        "Conflict detected on {}: {}",
-                        conflict_path, conflict_msg
-                    ));
-                    result
-                }
-            })
-            .collect();
-        return PatchResult {
-            operations: results,
-        };
+    let mut session = PatchSession::new(base_dir, threshold);
+    let total = ops.len();
+    let mut results: Vec<OpResult> = Vec::with_capacity(total);
+    let mut rollback_msg: Option<String> = None;
+
+    for (idx, op) in ops.into_iter().enumerate() {
+        let batch = Some((idx + 1, total));
+        if let Some(ref message) = rollback_msg {
+            results.push(make_skipped_op_from_file_op(&op, message, batch));
+            continue;
+        }
+
+        let mutating = is_mutating_op(&op);
+        let result = session.stage_op(op, batch);
+        let failed = matches!(
+            result.status,
+            OpStatus::FatalError | OpStatus::RecoverableError
+        );
+
+        if mutating && failed {
+            rollback_msg = Some(format!(
+                "Batch rolled back due to failure at op {}/{}: {}",
+                result.batch_index.unwrap_or(0),
+                result.batch_total.unwrap_or(0),
+                result.message
+            ));
+        }
+
+        results.push(result);
     }
 
-    let transaction = PatchTransaction::new();
-
-    // Step 2: Prepare phase - parallel execution using rayon
-    // We need to preserve operation order for results, so we collect with indices
-    let total = ops.len();
-    let results: Vec<(usize, OpResult)> = ops
-        .into_iter()
-        .enumerate()
-        .collect::<Vec<_>>()
-        .into_par_iter()
-        .map(|(idx, op)| {
-            (
-                idx,
-                prepare_op(
-                    op,
-                    base_dir,
-                    &transaction,
-                    threshold,
-                    Some((idx + 1, total)),
-                ),
-            )
-        })
-        .collect();
-
-    // Sort results by original index to preserve order
-    let mut results: Vec<OpResult> = results.into_iter().map(|(_, r)| r).collect();
-
-    // Check if any operation failed
-    let failed_op = results
-        .iter()
-        .find(|r| r.status == OpStatus::FatalError || r.status == OpStatus::RecoverableError);
-
-    // If any op failed, Drop cleans up shadow files - set rollback_reason for OK ops
-    if let Some(failed) = failed_op {
-        let rollback_msg = format!(
-            "Batch rolled back due to failure at op {}/{}: {}",
-            failed.batch_index.unwrap_or(0),
-            failed.batch_total.unwrap_or(0),
-            failed.message
-        );
+    if let Some(message) = rollback_msg {
         for r in &mut results {
-            if r.status == OpStatus::Ok {
+            if is_mutating_result(r) && r.status == OpStatus::Ok {
                 r.status = OpStatus::Skipped;
-                r.rollback_reason = Some(rollback_msg.clone());
+                r.rollback_reason = Some(message.clone());
             }
         }
         return PatchResult {
@@ -403,12 +721,10 @@ pub fn weave_patch_with_threshold(
         };
     }
 
-    // Step 3: Commit phase - sequential for atomicity
-    if let Err(e) = transaction.commit() {
-        // Mark all "ok" ops as failed due to commit error
+    if let Err(e) = session.commit() {
         let rollback_msg = format!("Commit failed: {e}");
         for r in &mut results {
-            if r.status == OpStatus::Ok {
+            if is_mutating_result(r) && r.status == OpStatus::Ok {
                 r.status = OpStatus::FatalError;
                 r.message = rollback_msg.clone();
                 r.rollback_reason = Some(rollback_msg.clone());
@@ -425,7 +741,7 @@ pub fn weave_patch_with_threshold(
 fn prepare_op(
     op: FileOp,
     base_dir: &Path,
-    tx: &PatchTransaction,
+    tx: &mut PatchTransaction,
     threshold: Option<f32>,
     batch: Option<(usize, usize)>,
 ) -> OpResult {
@@ -433,7 +749,7 @@ fn prepare_op(
         FileOp::Add { path, content } => {
             let resolved = resolve_path(base_dir, &path);
             let full_path = resolved.full_path;
-            match stage_add(&full_path, &content, tx) {
+            match stage_add(&full_path, &path, resolved.source, &content, tx) {
                 Ok(result) => {
                     let mut op = make_op(&path, "add", OpStatus::Ok, &result.message, batch);
                     op.warnings = result.warnings;
@@ -447,7 +763,7 @@ fn prepare_op(
         FileOp::Write { path, content } => {
             let resolved = resolve_path(base_dir, &path);
             let full_path = resolved.full_path;
-            match stage_write(&full_path, &path, &content, tx) {
+            match stage_write(&full_path, &path, resolved.source, &content, tx) {
                 Ok(result) => {
                     let mut op = make_op(&path, "write", OpStatus::Ok, &result.message, batch);
                     op.warnings = result.warnings;
@@ -486,15 +802,7 @@ fn prepare_op(
                 Ok(result) => {
                     if let Some(ref dest) = move_to {
                         let dest_path = resolve_path(base_dir, dest).full_path;
-                        // Re-target the staged shadow to move destination
-                        if let Some(entry) = tx
-                            .staged_files
-                            .lock()
-                            .iter_mut()
-                            .find(|(s, _)| *s == result.shadow_path)
-                        {
-                            entry.1 = dest_path;
-                        }
+                        tx.retarget_shadow(&result.shadow_path, dest_path);
                         // Queue original file for deletion (atomic with commit)
                         tx.queue_deletion(full_path);
                         let mut op = make_op(
@@ -530,49 +838,19 @@ fn prepare_op(
             offset: _,
             limit: _,
         } => {
-            // Read operations don't stage files — they just validate and return success
             let resolved = resolve_path(base_dir, &path);
-            let full_path = resolved.full_path;
-            if !full_path.exists() {
-                return with_path_source(
-                    make_error_op(
-                        &path,
-                        "read",
-                        &file_not_found_error(&path, &full_path, resolved.source),
-                        batch,
-                    ),
-                    resolved.source,
-                );
-            }
-            let meta = match full_path.symlink_metadata() {
-                Ok(m) => m,
-                Err(e) => {
-                    return with_path_source(
-                        make_op(
-                            &path,
-                            "read",
-                            OpStatus::FatalError,
-                            &format!("IO error: {e}"),
-                            batch,
-                        ),
-                        resolved.source,
-                    );
-                }
-            };
-            if meta.file_type().is_symlink() {
-                return with_path_source(
+            match virtual_path_kind_for_user(&resolved.full_path, &path, resolved.source, tx) {
+                Ok(VirtualPathKind::File) => with_path_source(
                     make_op(
                         &path,
                         "read",
-                        OpStatus::FatalError,
-                        "Symlink rejected",
+                        OpStatus::Ok,
+                        &format!("read: {} (ok)", path),
                         batch,
                     ),
                     resolved.source,
-                );
-            }
-            if !meta.is_file() {
-                return with_path_source(
+                ),
+                Ok(VirtualPathKind::Directory) => with_path_source(
                     make_op(
                         &path,
                         "read",
@@ -581,18 +859,20 @@ fn prepare_op(
                         batch,
                     ),
                     resolved.source,
-                );
-            }
-            with_path_source(
-                make_op(
-                    &path,
-                    "read",
-                    OpStatus::Ok,
-                    &format!("read: {} (ok)", path),
-                    batch,
                 ),
-                resolved.source,
-            )
+                Ok(VirtualPathKind::Missing) => with_path_source(
+                    make_error_op(
+                        &path,
+                        "read",
+                        &file_not_found_error(&path, &resolved.full_path, resolved.source),
+                        batch,
+                    ),
+                    resolved.source,
+                ),
+                Err(e) => {
+                    with_path_source(make_error_op(&path, "read", &e, batch), resolved.source)
+                }
+            }
         }
         FileOp::Map {
             path,
@@ -600,20 +880,18 @@ fn prepare_op(
             output_limit: _,
         } => {
             let resolved = resolve_path(base_dir, &path);
-            let full_path = resolved.full_path;
-            if !full_path.exists() {
-                return with_path_source(
-                    make_error_op(
+            match virtual_path_kind_for_user(&resolved.full_path, &path, resolved.source, tx) {
+                Ok(VirtualPathKind::Directory) => with_path_source(
+                    make_op(
                         &path,
                         "map",
-                        &file_not_found_error(&path, &full_path, resolved.source),
+                        OpStatus::Ok,
+                        &format!("map: {} (ok)", path),
                         batch,
                     ),
                     resolved.source,
-                );
-            }
-            if !full_path.is_dir() {
-                return with_path_source(
+                ),
+                Ok(VirtualPathKind::File) => with_path_source(
                     make_op(
                         &path,
                         "map",
@@ -622,18 +900,18 @@ fn prepare_op(
                         batch,
                     ),
                     resolved.source,
-                );
-            }
-            with_path_source(
-                make_op(
-                    &path,
-                    "map",
-                    OpStatus::Ok,
-                    &format!("map: {} (ok)", path),
-                    batch,
                 ),
-                resolved.source,
-            )
+                Ok(VirtualPathKind::Missing) => with_path_source(
+                    make_error_op(
+                        &path,
+                        "map",
+                        &file_not_found_error(&path, &resolved.full_path, resolved.source),
+                        batch,
+                    ),
+                    resolved.source,
+                ),
+                Err(e) => with_path_source(make_error_op(&path, "map", &e, batch), resolved.source),
+            }
         }
         FileOp::Move { from, to } => {
             let resolved_from = resolve_path(base_dir, &from);
@@ -641,88 +919,48 @@ fn prepare_op(
             let resolved_to = resolve_path(base_dir, &to);
             let full_to = resolved_to.full_path;
 
-            // Source must exist and not be a symlink
-            if !full_from.exists() {
-                return with_path_source(
-                    make_error_op(
-                        &from,
-                        "move",
-                        &file_not_found_error(&from, &full_from, resolved_from.source),
-                        batch,
-                    ),
-                    resolved_from.source,
-                );
-            }
-            let meta = match full_from.symlink_metadata() {
-                Ok(m) => m,
-                Err(e) => {
+            let content = match read_virtual_text(&full_from, &from, resolved_from.source, tx) {
+                Ok(Some((content, _))) => content,
+                Ok(None) => {
                     return with_path_source(
-                        make_op(
+                        make_error_op(
                             &from,
                             "move",
-                            OpStatus::FatalError,
-                            &format!("IO error: {e}"),
+                            &file_not_found_error(&from, &full_from, resolved_from.source),
                             batch,
                         ),
                         resolved_from.source,
                     );
                 }
-            };
-            if meta.file_type().is_symlink() {
-                return with_path_source(
-                    make_op(
-                        &from,
-                        "move",
-                        OpStatus::FatalError,
-                        "Source is a symlink, move rejected",
-                        batch,
-                    ),
-                    resolved_from.source,
-                );
-            }
-            if !meta.is_file() {
-                return with_path_source(
-                    make_op(
-                        &from,
-                        "move",
-                        OpStatus::FatalError,
-                        "Source is not a regular file",
-                        batch,
-                    ),
-                    resolved_from.source,
-                );
-            }
-
-            // Destination must NOT exist
-            if full_to.exists() {
-                return with_path_source(
-                    make_op(
-                        &to,
-                        "move",
-                        OpStatus::FatalError,
-                        "Destination already exists",
-                        batch,
-                    ),
-                    resolved_to.source,
-                );
-            }
-
-            // Read source content
-            let content = match std::fs::read_to_string(&full_from) {
-                Ok(c) => c,
                 Err(e) => {
                     return with_path_source(
-                        make_op(
-                            &from,
-                            "move",
-                            OpStatus::FatalError,
-                            &format!("Failed to read source: {e}"),
-                            batch,
-                        ),
+                        make_error_op(&from, "move", &e, batch),
                         resolved_from.source,
                     );
                 }
             };
+
+            match virtual_path_kind_for_user(&full_to, &to, resolved_to.source, tx) {
+                Ok(VirtualPathKind::Missing) => {}
+                Ok(_) => {
+                    return with_path_source(
+                        make_op(
+                            &to,
+                            "move",
+                            OpStatus::FatalError,
+                            "Destination already exists",
+                            batch,
+                        ),
+                        resolved_to.source,
+                    );
+                }
+                Err(e) => {
+                    return with_path_source(
+                        make_error_op(&to, "move", &e, batch),
+                        resolved_to.source,
+                    );
+                }
+            }
 
             // Stage content to shadow destination
             let shadow = shadow_path_for(&full_to);
@@ -957,11 +1195,13 @@ struct StageAddResult {
 
 fn stage_add(
     path: &Path,
+    display_path: &str,
+    path_source: PathSource,
     content: &str,
-    tx: &PatchTransaction,
+    tx: &mut PatchTransaction,
 ) -> Result<StageAddResult, PatchError> {
-    if path.exists() {
-        return Err(PatchError::FileAlreadyExists(path.display().to_string()));
+    if read_virtual_text(path, display_path, path_source, tx)?.is_some() {
+        return Err(PatchError::FileAlreadyExists(display_path.to_string()));
     }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -995,26 +1235,14 @@ struct StageWriteResult {
 fn stage_write(
     path: &Path,
     display_path: &str,
+    path_source: PathSource,
     content: &str,
-    tx: &PatchTransaction,
+    tx: &mut PatchTransaction,
 ) -> Result<StageWriteResult, PatchError> {
     let mut original: Option<String> = None;
     let mut original_line_count = 0;
 
-    if path.exists() {
-        let meta = path.symlink_metadata()?;
-        if meta.file_type().is_symlink() {
-            return Err(PatchError::SymlinkRejected(display_path.to_string()));
-        }
-        if !meta.is_file() {
-            return Err(PatchError::Io(std::io::Error::other(
-                "write target is not a regular file",
-            )));
-        }
-
-        let existing = std::fs::read_to_string(path)?
-            .replace("\r\n", "\n")
-            .replace('\r', "\n");
+    if let Some((existing, _)) = read_virtual_text(path, display_path, path_source, tx)? {
         original_line_count = existing.lines().count();
         original = Some(existing);
     }
@@ -1065,21 +1293,11 @@ fn stage_delete(
     path: &Path,
     display_path: &str,
     path_source: PathSource,
-    tx: &PatchTransaction,
+    tx: &mut PatchTransaction,
 ) -> Result<StageDeleteResult, PatchError> {
-    if !path.exists() {
+    let Some((original, _)) = read_virtual_text(path, display_path, path_source, tx)? else {
         return Err(file_not_found_error(display_path, path, path_source));
-    }
-    // Reject symlinks
-    let meta = path.symlink_metadata()?;
-    if meta.file_type().is_symlink() {
-        return Err(PatchError::SymlinkRejected(display_path.to_string()));
-    }
-
-    // Count lines in the file being deleted
-    let original = std::fs::read_to_string(path)?
-        .replace("\r\n", "\n")
-        .replace('\r', "\n");
+    };
     let line_count = original.lines().count();
 
     tx.queue_deletion(path.to_path_buf());
@@ -1105,21 +1323,12 @@ fn stage_update(
     display_path: &str,
     path_source: PathSource,
     hunks: &[Hunk],
-    tx: &PatchTransaction,
+    tx: &mut PatchTransaction,
     threshold: Option<f32>,
 ) -> Result<StageUpdateResult, PatchError> {
-    if !path.exists() {
+    let Some((original, _)) = read_virtual_text(path, display_path, path_source, tx)? else {
         return Err(file_not_found_error(display_path, path, path_source));
-    }
-    // Reject symlinks
-    let meta = path.symlink_metadata()?;
-    if meta.file_type().is_symlink() {
-        return Err(PatchError::SymlinkRejected(display_path.to_string()));
-    }
-
-    let original = std::fs::read_to_string(path)?
-        .replace("\r\n", "\n")
-        .replace('\r', "\n");
+    };
     let original_line_count = original.lines().count();
     let mut file_lines: Vec<String> = original.lines().map(|l| l.to_string()).collect();
 
@@ -2081,7 +2290,7 @@ mod tests {
     }
 
     #[test]
-    fn test_write_conflicts_with_update_on_same_file() {
+    fn test_write_then_update_rolls_back_on_staged_context_mismatch() {
         let dir = tmp();
         fs::write(dir.path().join("conflict.txt"), "old\n").unwrap();
 
@@ -2104,13 +2313,55 @@ mod tests {
         ];
 
         let result = weave_patch(ops, dir.path());
-        assert_eq!(result.operations[0].status, OpStatus::FatalError);
+        assert_eq!(result.operations[0].status, OpStatus::Skipped);
         assert!(
             result.operations[0]
-                .message
-                .contains("Cannot combine Write with other write operations")
+                .rollback_reason
+                .as_ref()
+                .unwrap()
+                .contains("rolled back")
         );
-        assert_eq!(result.operations[1].status, OpStatus::FatalError);
+        assert_eq!(result.operations[1].status, OpStatus::RecoverableError);
+        assert!(
+            result.operations[1].message.contains("context not found")
+                || result.operations[1].message.contains("locate hunk")
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("conflict.txt")).unwrap(),
+            "old\n"
+        );
+    }
+
+    #[test]
+    fn test_write_then_update_uses_staged_content() {
+        let dir = tmp();
+        fs::write(dir.path().join("staged.txt"), "old\n").unwrap();
+
+        let ops = vec![
+            FileOp::Write {
+                path: "staged.txt".to_string(),
+                content: "new\n".to_string(),
+            },
+            FileOp::Update {
+                path: "staged.txt".to_string(),
+                hunks: vec![Hunk {
+                    context_hint: None,
+                    lines: vec![
+                        DiffLine::Context("new".to_string()),
+                        DiffLine::Add("newer".to_string()),
+                    ],
+                }],
+                move_to: None,
+            },
+        ];
+
+        let result = weave_patch(ops, dir.path());
+        assert_eq!(result.operations[0].status, OpStatus::Ok);
+        assert_eq!(result.operations[1].status, OpStatus::Ok);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("staged.txt")).unwrap(),
+            "new\nnewer\n"
+        );
     }
 
     // F1: Path traversal tests (sandbox removed, paths now allowed)
@@ -2811,7 +3062,7 @@ echo hello
         let result = weave_patch(ops, dir.path());
         assert_eq!(result.operations.len(), 1);
         assert_eq!(result.operations[0].status, OpStatus::FatalError);
-        assert!(result.operations[0].message.contains("Symlink"));
+        assert!(result.operations[0].message.contains("symlink"));
     }
 
     #[test]
@@ -3109,7 +3360,7 @@ echo hello
         assert!(!dir.path().join("moved.txt").exists());
     }
 }
-fn make_error_op(
+pub(crate) fn make_error_op(
     path: &str,
     op_type: &str,
     error: &crate::error::PatchError,

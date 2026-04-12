@@ -7,16 +7,20 @@ use rmcp::{
     tool, tool_handler, tool_router,
     transport::stdio,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use crate::applier::{self, PathSource, ResolvedPath, resolve_path};
-use crate::{parser, reader};
+use crate::applier::{
+    self, OpResult, OpStatus, PatchSession, VirtualPathKind, make_error_op, make_op,
+    with_path_source,
+};
+use crate::error::PatchError;
+use crate::{parser, reader, tool_contract};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct BatchExecParams {
     #[schemars(
-        description = "Compact patch text containing view/read, map, create, write, update, move, and delete operations. Wrap in === begin / === end."
+        description = "Compact patch text containing view/read, map, create, write, update, move, and delete operations. Use weave syntax wrapped in === begin / === end, or paste native apply_patch-style *** Begin Patch blocks."
     )]
     pub patch: String,
 
@@ -24,6 +28,18 @@ pub struct BatchExecParams {
         description = "Optional fuzzy matching threshold (0.0-1.0). Higher values (e.g., 0.97) require stricter matching. Default: 0.97."
     )]
     pub threshold: Option<f32>,
+
+    #[schemars(
+        description = "When true, preview the batch against staged state without committing filesystem changes."
+    )]
+    #[serde(default)]
+    pub dry_run: bool,
+
+    #[schemars(
+        description = "Response format. Use 'text' for the human-readable summary (default) or 'json' for a machine-readable JSON payload in the tool text response."
+    )]
+    #[serde(default)]
+    pub response_format: Option<ResponseFormat>,
 }
 
 /// Metrics tracked during map operations.
@@ -32,6 +48,46 @@ pub struct MapMetrics {
     pub file_count: usize,
     pub total_lines: usize,
     pub max_depth: usize,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponseFormat {
+    #[default]
+    Text,
+    Json,
+}
+
+#[derive(Debug, Serialize)]
+struct ExecutionSummary {
+    total_operations: usize,
+    ok_operations: usize,
+    skipped_operations: usize,
+    error_operations: usize,
+    add_operations: usize,
+    write_operations: usize,
+    update_operations: usize,
+    delete_operations: usize,
+    move_operations: usize,
+    read_operations: usize,
+    map_operations: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct ExecutionReport {
+    ok: bool,
+    dry_run: bool,
+    committed: bool,
+    summary: ExecutionSummary,
+    operations: Vec<OpResult>,
+}
+
+struct ReadRequest<'a> {
+    path: &'a str,
+    symbols: Option<&'a [String]>,
+    language: Option<&'a str>,
+    offset: Option<usize>,
+    limit: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -47,18 +103,21 @@ impl WeavePatchServer {
         }
     }
 
-    #[tool(
-        name = "patch__exec",
-        description = "Unified workspace tool for agents moving from Copilot CLI `view` + `apply_patch`: `view`/`read`, `map`, `create`, `write`, `update`, `move`, and `delete` in one atomic call.\nVersion: 0.0.16\n\nFORMAT: wrap operations in === begin / === end.\n\nFAMILIAR ALIASES:\n  - view <path> ...      alias for read\n  - write <path> ...     create or overwrite a whole file atomically\n  - create/write bodies  accept raw text or apply_patch-style + lines\n\nEXAMPLES:\n\n1. View a file:\n  === begin\n  view src/main.rs\n  === end\n\n2. View with 1-based line range:\n  === begin\n  view src/lib.rs start=11 end=40\n  === end\n\n3. Read with symbols:\n  === begin\n  read src/lib.rs symbols=Server,handle_request language=rust\n  === end\n\n4. Write a file (create or overwrite):\n  === begin\n  write src/hello.rs\n  +pub fn hello() { println!(\"Hello!\"); }\n  === end\n\n5. Update a file:\n  === begin\n  update src/lib.rs\n  @@ fn main\n   fn main() {\n  -    old_code();\n  +    new_code();\n   }\n  === end\n\n6. Move a file:\n  === begin\n  move src/old.rs src/new.rs\n  === end\n\n7. Combined operations:\n  === begin\n  view src/main.rs\n  update src/lib.rs\n  @@ fn main\n   fn main() {\n  -    old();\n  +    new();\n   }\n  write src/greet.rs\n  +pub fn greet() { println!(\"hi\"); }\n  delete src/deprecated.rs\n  === end\n\nOPTIONS:\n  view|read <path> [symbols=a,b] [language=rust] [offset=N] [limit=N] [start=N] [end=N]\n  map <path> [depth=N] [limit=N]\n  create <path>   content lines (create only; raw text or all + lines)\n  write <path>    content lines (create or overwrite; raw text or all + lines)\n  update <path>   @@ hint (optional)   context/ -/ + lines\n  delete <path>\n  move <from> <to>\n  move_to <path>  (inside Update)\n\nDEFAULTS:\n  - Fuzzy matching threshold: 0.97\n  - Map depth: 3, output limit: 6000 chars\n  - File read truncation: 1000 lines unless symbols/limit/start-end specified\n\nSECURITY: No symlinks. Relative paths (including ../), absolute paths, and ~ home expansion are allowed.\n\nVALIDATORS (advisory): rustfmt, py_compile, gofmt, json.tool, bash -n, node --check, terraform fmt"
-    )]
+    #[doc = include_str!("patch_exec_description.txt")]
+    #[tool(name = "patch__exec")]
     async fn exec(
         &self,
         Parameters(params): Parameters<BatchExecParams>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let response_format = params.response_format.unwrap_or_default();
+
         if params.patch.is_empty() {
-            return Ok(CallToolResult::error(vec![Content::text(
+            let payload = self.render_error_payload(
                 "patch is required. Wrap operations in === begin / === end.",
-            )]));
+                params.dry_run,
+                response_format,
+            );
+            return Ok(CallToolResult::error(vec![Content::text(payload)]));
         }
 
         let base_dir = match std::env::current_dir() {
@@ -66,391 +125,447 @@ impl WeavePatchServer {
             Err(e) => {
                 let msg = format!("Cannot determine working directory: {e}");
                 tracing::error!("{}", msg);
-                return Ok(CallToolResult::error(vec![Content::text(msg)]));
+                let payload = self.render_error_payload(&msg, params.dry_run, response_format);
+                return Ok(CallToolResult::error(vec![Content::text(payload)]));
             }
         };
 
-        let mut output_parts: Vec<String> = Vec::new();
-
-        let parse_result = match parser::parse_patch(&params.patch) {
-            Ok(result) => result,
-            Err(e) => {
-                let msg = format!("Parse error: {e}");
+        let report = match self.execute_batch_at(&base_dir, &params).await {
+            Ok(report) => report,
+            Err(msg) => {
                 tracing::error!("{}", msg);
-                output_parts.push(format!("PATCH ERROR: {}", msg));
-                let combined = output_parts.join("\n---\n");
-                return Ok(CallToolResult::error(vec![Content::text(combined)]));
+                let payload = self.render_error_payload(&msg, params.dry_run, response_format);
+                return Ok(CallToolResult::error(vec![Content::text(payload)]));
             }
         };
 
-        // Separate Read operations from write operations
-        let (read_ops, write_ops): (Vec<_>, Vec<_>) = parse_result
-            .ops
-            .into_iter()
-            .partition(|op| matches!(op, parser::FileOp::Read { .. } | parser::FileOp::Map { .. }));
+        let payload = self.render_report_payload(&report, response_format);
+        tracing::info!("weave_patch result: {}", payload);
 
-        // Execute Read operations first (read-only, safe)
-        if !read_ops.is_empty() {
-            let canonical_base = match base_dir.canonicalize() {
-                Ok(p) => p,
-                Err(e) => {
-                    let msg = format!("Cannot canonicalize working directory: {e}");
-                    tracing::error!("{}", msg);
-                    return Ok(CallToolResult::error(vec![Content::text(msg)]));
-                }
-            };
+        if report.ok {
+            Ok(CallToolResult::success(vec![Content::text(payload)]))
+        } else {
+            Ok(CallToolResult::error(vec![Content::text(payload)]))
+        }
+    }
 
-            const MAX_TOTAL: usize = 2 * 1024 * 1024;
-            const MAX_FILE: usize = 512 * 1024;
+    async fn execute_batch_at(
+        &self,
+        base_dir: &Path,
+        params: &BatchExecParams,
+    ) -> Result<ExecutionReport, String> {
+        let parse_result =
+            parser::parse_patch(&params.patch).map_err(|e| format!("Parse error: {e}"))?;
+        let threshold = parse_result.threshold.or(params.threshold);
+        let mut session = PatchSession::new(base_dir, threshold);
+        let total = parse_result.ops.len();
+        let mut operations: Vec<OpResult> = Vec::with_capacity(total);
+        let mut rollback_msg: Option<String> = None;
+        let mut total_output_bytes = 0usize;
+        let mut output_limit_hit = false;
 
-            let mut read_results: Vec<String> = Vec::new();
-            let mut total_bytes: usize = 0;
+        for (idx, op) in parse_result.ops.into_iter().enumerate() {
+            let batch = Some((idx + 1, total));
+            if let Some(ref message) = rollback_msg {
+                operations.push(self.skipped_result(&op, message, batch));
+                continue;
+            }
 
-            for op in &read_ops {
-                match op {
-                    parser::FileOp::Map {
-                        path,
-                        depth,
-                        output_limit,
-                    } => {
-                        let map_result = match self
-                            .execute_map(&canonical_base, path, *depth, *output_limit)
-                            .await
-                        {
-                            Ok(result) => result,
-                            Err(e) => format!("Map error for '{}': {}", path, e),
-                        };
-
-                        let mut map_out = format!("--- Map: {} ---\n{}", path, map_result);
-
-                        if let Some(limit) = output_limit
-                            && map_out.len() > *limit
-                        {
-                            map_out.truncate(*limit);
-                            map_out.push_str("\n... [truncated: output limit reached]");
-                        }
-
-                        if total_bytes + map_out.len() > MAX_TOTAL {
-                            read_results.push(
-                                "... [truncated: total output exceeds 2MB limit]".to_string(),
-                            );
-                            break;
-                        }
-
-                        total_bytes += map_out.len();
-                        read_results.push(map_out);
-                        continue;
-                    }
-                    parser::FileOp::Read {
-                        path,
-                        symbols,
-                        language,
+            let mut result = match op {
+                parser::FileOp::Read {
+                    path,
+                    symbols,
+                    language,
+                    offset,
+                    limit,
+                } => self.perform_read(
+                    &session,
+                    ReadRequest {
+                        path: &path,
+                        symbols: symbols.as_deref(),
+                        language: language.as_deref(),
                         offset,
                         limit,
-                    } => {
-                        let (content, path_source) =
-                            match self.read_single_file(&canonical_base, path).await {
-                                Ok((c, ps)) => (c, ps),
-                                Err(e) => {
-                                    read_results
-                                        .push(format!("--- {} [base] ---\nError: {}", path, e));
-                                    continue;
-                                }
-                            };
+                    },
+                    batch,
+                ),
+                parser::FileOp::Map {
+                    path,
+                    depth,
+                    output_limit,
+                } => {
+                    self.perform_map(&session, &path, depth, output_limit, batch)
+                        .await
+                }
+                other => session.stage_op(other, batch),
+            };
 
-                        // Apply default 1000-line truncation if no explicit limit/symbols
-                        const DEFAULT_LINE_LIMIT: usize = 1000;
-                        let effective_limit = if symbols.is_some() || limit.is_some() {
-                            *limit // Use explicit limit or None
-                        } else {
-                            Some(DEFAULT_LINE_LIMIT) // Apply default truncation
-                        };
+            self.apply_output_limits(&mut result, &mut total_output_bytes, &mut output_limit_hit);
 
-                        let total_lines = content.lines().count();
-                        let (formatted, header_suffix, truncated_notice) = if let Some(syms) =
-                            symbols
-                        {
-                            if !syms.is_empty() {
-                                let lang = language.clone().unwrap_or_else(|| infer_language(path));
-                                let extracted = reader::extract_symbols(&content, &lang, syms);
-                                (extracted, "[symbols]".to_string(), String::new())
-                            } else {
-                                let (sliced, start, end) =
-                                    reader::apply_line_range(&content, *offset, effective_limit);
-                                (
-                                    sliced,
-                                    format!("[lines {}-{} of {}]", start, end, total_lines),
-                                    String::new(),
-                                )
-                            }
+            if is_mutating_result(&result)
+                && matches!(
+                    result.status,
+                    OpStatus::FatalError | OpStatus::RecoverableError
+                )
+            {
+                rollback_msg = Some(format!(
+                    "Batch rolled back due to failure at op {}/{}: {}",
+                    result.batch_index.unwrap_or(0),
+                    result.batch_total.unwrap_or(0),
+                    result.message
+                ));
+            }
+
+            operations.push(result);
+        }
+
+        let mut committed = false;
+        if let Some(message) = rollback_msg {
+            for op in &mut operations {
+                if is_mutating_result(op) && op.status == OpStatus::Ok {
+                    op.status = OpStatus::Skipped;
+                    op.rollback_reason = Some(message.clone());
+                }
+            }
+        } else if params.dry_run {
+            let note = "Dry run: preview only; no filesystem changes committed".to_string();
+            for op in &mut operations {
+                if is_mutating_result(op) && op.status == OpStatus::Ok {
+                    op.rollback_reason = Some(note.clone());
+                }
+            }
+        } else if let Err(e) = session.commit() {
+            let message = format!("Commit failed: {e}");
+            for op in &mut operations {
+                if is_mutating_result(op) && op.status == OpStatus::Ok {
+                    op.status = OpStatus::FatalError;
+                    op.message = message.clone();
+                    op.rollback_reason = Some(message.clone());
+                }
+            }
+        } else {
+            committed = true;
+        }
+
+        let ok = !operations
+            .iter()
+            .any(|op| matches!(op.status, OpStatus::FatalError | OpStatus::RecoverableError));
+
+        Ok(ExecutionReport {
+            ok,
+            dry_run: params.dry_run,
+            committed,
+            summary: build_summary(&operations),
+            operations,
+        })
+    }
+
+    fn perform_read(
+        &self,
+        session: &PatchSession,
+        request: ReadRequest<'_>,
+        batch: Option<(usize, usize)>,
+    ) -> OpResult {
+        let path = request.path;
+        let symbols = request.symbols;
+        let language = request.language;
+        let offset = request.offset;
+        let limit = request.limit;
+        let resolved = session.resolve_path(path);
+        let read_result = session.read_virtual_file(path);
+
+        match read_result {
+            Ok(virtual_read) => {
+                let bytes = virtual_read.bytes;
+                let check_len = std::cmp::min(bytes.len(), 8192);
+                let is_binary = bytes[..check_len].contains(&0);
+
+                let (formatted, header_suffix, truncated_notice) = if is_binary {
+                    (
+                        "[binary file - content not displayed]".to_string(),
+                        "[binary]".to_string(),
+                        String::new(),
+                    )
+                } else {
+                    let content = match String::from_utf8(bytes) {
+                        Ok(content) => content,
+                        Err(e) => {
+                            return with_path_source(
+                                make_error_op(
+                                    path,
+                                    "read",
+                                    &PatchError::Io(std::io::Error::other(format!(
+                                        "UTF-8 decode error: {e}"
+                                    ))),
+                                    batch,
+                                ),
+                                resolved.source,
+                            );
+                        }
+                    };
+
+                    let effective_limit = if symbols.is_some() || limit.is_some() {
+                        limit
+                    } else {
+                        Some(tool_contract::DEFAULT_READ_LINE_LIMIT)
+                    };
+                    let total_lines = content.lines().count();
+
+                    if let Some(symbol_list) = symbols {
+                        if !symbol_list.is_empty() {
+                            let lang = language
+                                .map(str::to_string)
+                                .unwrap_or_else(|| infer_language(path));
+                            (
+                                reader::extract_symbols(&content, &lang, symbol_list),
+                                "[symbols]".to_string(),
+                                String::new(),
+                            )
                         } else {
                             let (sliced, start, end) =
-                                reader::apply_line_range(&content, *offset, effective_limit);
-                            let notice = if limit.is_none()
-                                && content.lines().count() > DEFAULT_LINE_LIMIT
-                            {
-                                format!(
-                                    "\n... [truncated at {} lines - use limit or symbols for full file]",
-                                    DEFAULT_LINE_LIMIT
-                                )
-                            } else {
-                                String::new()
-                            };
+                                reader::apply_line_range(&content, offset, effective_limit);
                             (
                                 sliced,
                                 format!("[lines {}-{} of {}]", start, end, total_lines),
-                                notice,
+                                String::new(),
                             )
-                        };
-
-                        let mut file_out = format!(
-                            "--- {} [{}] {} ---\n{}{}",
-                            path, path_source, header_suffix, formatted, truncated_notice
-                        );
-
-                        if file_out.len() > MAX_FILE {
-                            file_out.truncate(MAX_FILE);
-                            file_out.push_str("\n... [truncated: file exceeds 512KB limit]");
                         }
-
-                        if total_bytes + file_out.len() > MAX_TOTAL {
-                            read_results.push(
-                                "... [truncated: total output exceeds 2MB limit]".to_string(),
-                            );
-                            break;
-                        }
-
-                        total_bytes += file_out.len();
-                        read_results.push(file_out);
-                    }
-                    _ => continue, // Add/Delete/Update won't be in read_ops
-                }
-            }
-
-            if !read_results.is_empty() {
-                output_parts.push(read_results.join("\n\n"));
-            }
-        }
-
-        // Execute Write operations (add/update/delete)
-        let result = applier::weave_patch_with_threshold(
-            write_ops,
-            &base_dir,
-            parse_result.threshold.or(params.threshold),
-        );
-
-        let has_error = result
-            .operations
-            .iter()
-            .any(|op| op.status == OpStatus::FatalError || op.status == OpStatus::RecoverableError);
-
-        let patch_output = if has_error {
-            result
-                .operations
-                .iter()
-                .filter(|op| {
-                    op.status == OpStatus::FatalError || op.status == OpStatus::RecoverableError
-                })
-                .map(|op| {
-                    let base = format!(
-                        "[ERROR] {} \u{2014} {}: {}",
-                        op.op_type, op.path, op.message
-                    );
-                    if let Some(ref llm_json) = op.llm_error {
-                        format!("{}\n```json\n{}\n```", base, llm_json)
                     } else {
-                        base
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        } else {
-            // Count operations by type for summary header
-            let creates = result
-                .operations
-                .iter()
-                .filter(|op| op.op_type == "add")
-                .count();
-            let writes = result
-                .operations
-                .iter()
-                .filter(|op| op.op_type == "write")
-                .count();
-            let updates = result
-                .operations
-                .iter()
-                .filter(|op| op.op_type == "update")
-                .count();
-            let deletes = result
-                .operations
-                .iter()
-                .filter(|op| op.op_type == "delete")
-                .count();
-            let total = result.operations.len();
-
-            let mut lines: Vec<String> = Vec::new();
-
-            // Prepend summary header for write operations
-            if creates + writes + updates + deletes > 0 {
-                let mut summary = format!("✓ {} operations completed", total);
-                let mut parts = Vec::new();
-                if creates > 0 {
-                    parts.push(format!("{} created", creates));
-                }
-                if writes > 0 {
-                    parts.push(format!("{} written", writes));
-                }
-                if updates > 0 {
-                    parts.push(format!("{} updated", updates));
-                }
-                if deletes > 0 {
-                    parts.push(format!("{} deleted", deletes));
-                }
-                if !parts.is_empty() {
-                    summary.push_str(&format!(" ({})", parts.join(", ")));
-                }
-                lines.push(summary);
-            }
-
-            for op in &result.operations {
-                let warn_suffix = if op.warnings.is_empty() {
-                    String::new()
-                } else {
-                    format!(" [warnings: {}]", op.warnings.join("; "))
-                };
-
-                let batch_suffix = format_batch(&op.batch_index, &op.batch_total);
-                let header = match op.op_type.as_str() {
-                    "update" => {
-                        if let Some((before, after)) = op.line_changes {
+                        let (sliced, start, end) =
+                            reader::apply_line_range(&content, offset, effective_limit);
+                        let notice = if limit.is_none()
+                            && content.lines().count() > tool_contract::DEFAULT_READ_LINE_LIMIT
+                        {
                             format!(
-                                "✓ {} \u{2014} {} ({} \u{2192} {} lines){}{}",
-                                op.op_type, op.path, before, after, warn_suffix, batch_suffix
+                                "\n... [truncated at {} lines - use limit or symbols for full file]",
+                                tool_contract::DEFAULT_READ_LINE_LIMIT
                             )
                         } else {
-                            format!(
-                                "✓ {} \u{2014} {}{}{}",
-                                op.op_type, op.path, warn_suffix, batch_suffix
-                            )
-                        }
-                    }
-                    "add" => {
-                        if let Some((_, after)) = op.line_changes {
-                            format!(
-                                "✓ {} \u{2014} {} ({} lines){}{}",
-                                op.op_type, op.path, after, warn_suffix, batch_suffix
-                            )
-                        } else {
-                            format!(
-                                "✓ {} \u{2014} {}{}{}",
-                                op.op_type, op.path, warn_suffix, batch_suffix
-                            )
-                        }
-                    }
-                    "write" => {
-                        if let Some((before, after)) = op.line_changes {
-                            format!(
-                                "✓ {} \u{2014} {} ({} \u{2192} {} lines){}{}",
-                                op.op_type, op.path, before, after, warn_suffix, batch_suffix
-                            )
-                        } else {
-                            format!(
-                                "✓ {} \u{2014} {}{}{}",
-                                op.op_type, op.path, warn_suffix, batch_suffix
-                            )
-                        }
-                    }
-                    "delete" => {
-                        format!(
-                            "✓ {} \u{2014} {} ({}){}{}",
-                            op.op_type, op.path, op.message, warn_suffix, batch_suffix
+                            String::new()
+                        };
+                        (
+                            sliced,
+                            format!("[lines {}-{} of {}]", start, end, total_lines),
+                            notice,
                         )
                     }
-                    _ => format!(
-                        "✓ {} \u{2014} {}{}{}",
-                        op.op_type, op.path, warn_suffix, batch_suffix
-                    ),
                 };
 
-                lines.push(header);
-
-                // Append match_info for updates
-                if let Some(ref mi) = op.match_info
-                    && op.op_type == "update"
-                {
-                    if mi.contains("; ") {
-                        for (i, part) in mi.split("; ").enumerate() {
-                            lines.push(format!("  Hunk {}: {}", i + 1, part.trim()));
-                        }
-                    } else {
-                        lines.push(format!("  {mi}"));
-                    }
-                }
-
-                // Append truncated diff preview (max 5 lines)
-                if let Some(ref diff) = op.diff {
-                    let diff_lines: Vec<&str> = diff.lines().collect();
-                    for diff_line in diff_lines.iter().take(5) {
-                        lines.push(format!("   {diff_line}"));
-                    }
-                    if diff_lines.len() > 5 {
-                        let remaining = diff_lines.len() - 5;
-                        lines.push(format!("   ... (+{remaining} more lines)"));
-                    }
-                }
+                let staged_suffix = if virtual_read.staged { " [staged]" } else { "" };
+                let output = format!(
+                    "--- {} [{}]{} {} ---\n{}{}",
+                    path,
+                    virtual_read.path_source,
+                    staged_suffix,
+                    header_suffix,
+                    formatted,
+                    truncated_notice
+                );
+                let message = if virtual_read.staged {
+                    format!("read: {} (staged)", path)
+                } else {
+                    format!("read: {} (ok)", path)
+                };
+                let mut op = with_path_source(
+                    make_op(path, "read", OpStatus::Ok, &message, batch),
+                    virtual_read.path_source,
+                );
+                op.output = Some(output);
+                op
             }
-            if lines.is_empty() {
-                "No write operations performed.".to_string()
-            } else {
-                lines.join("\n")
+            Err(e) => with_path_source(make_error_op(path, "read", &e, batch), resolved.source),
+        }
+    }
+
+    async fn perform_map(
+        &self,
+        session: &PatchSession,
+        path: &str,
+        depth: Option<usize>,
+        output_limit: Option<usize>,
+        batch: Option<(usize, usize)>,
+    ) -> OpResult {
+        let resolved = session.resolve_path(path);
+        match self.execute_map(session, path, depth, output_limit).await {
+            Ok(result) => {
+                let mut op = with_path_source(
+                    make_op(
+                        path,
+                        "map",
+                        OpStatus::Ok,
+                        &format!("map: {} (ok)", path),
+                        batch,
+                    ),
+                    resolved.source,
+                );
+                op.output = Some(format!("--- Map: {} ---\n{}", path, result));
+                op
             }
+            Err(message) => {
+                let error = match session.resolve_virtual_kind(path) {
+                    Ok((resolved_path, VirtualPathKind::Missing)) => applier::file_not_found_error(
+                        path,
+                        &resolved_path.full_path,
+                        resolved_path.source,
+                    ),
+                    Ok((_, VirtualPathKind::File)) => {
+                        PatchError::Io(std::io::Error::other("Path is not a directory"))
+                    }
+                    Ok((_, VirtualPathKind::Directory)) => {
+                        PatchError::Io(std::io::Error::other(message))
+                    }
+                    Err(e) => e,
+                };
+                with_path_source(make_error_op(path, "map", &error, batch), resolved.source)
+            }
+        }
+    }
+
+    fn skipped_result(
+        &self,
+        op: &parser::FileOp,
+        message: &str,
+        batch: Option<(usize, usize)>,
+    ) -> OpResult {
+        let (op_type, path) = match op {
+            parser::FileOp::Add { path, .. } => ("add", path.as_str()),
+            parser::FileOp::Write { path, .. } => ("write", path.as_str()),
+            parser::FileOp::Delete { path } => ("delete", path.as_str()),
+            parser::FileOp::Update { path, .. } => ("update", path.as_str()),
+            parser::FileOp::Read { path, .. } => ("read", path.as_str()),
+            parser::FileOp::Map { path, .. } => ("map", path.as_str()),
+            parser::FileOp::Move { from, .. } => ("move", from.as_str()),
+        };
+        let mut result = make_op(
+            path,
+            op_type,
+            OpStatus::Skipped,
+            "Skipped due to earlier batch failure",
+            batch,
+        );
+        result.rollback_reason = Some(message.to_string());
+        result
+    }
+
+    fn apply_output_limits(
+        &self,
+        op: &mut OpResult,
+        total_output_bytes: &mut usize,
+        output_limit_hit: &mut bool,
+    ) {
+        const MAX_TOTAL_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
+        const MAX_FILE_OUTPUT_BYTES: usize = 512 * 1024;
+
+        let Some(output) = op.output.as_mut() else {
+            return;
         };
 
-        tracing::info!("weave_patch result: {}", patch_output);
-
-        if has_error {
-            output_parts.push(patch_output);
-            let combined = output_parts.join("\n---\n");
-            return Ok(CallToolResult::error(vec![Content::text(combined)]));
-        } else if !patch_output.is_empty() && patch_output != "No write operations performed." {
-            output_parts.push(patch_output);
+        if output.len() > MAX_FILE_OUTPUT_BYTES {
+            output.truncate(MAX_FILE_OUTPUT_BYTES);
+            output.push_str("\n... [truncated: file exceeds 512KB limit]");
         }
 
-        let combined = output_parts.join("\n---\n");
-        Ok(CallToolResult::success(vec![Content::text(combined)]))
+        if *output_limit_hit {
+            op.output = None;
+            return;
+        }
+
+        if *total_output_bytes + output.len() > MAX_TOTAL_OUTPUT_BYTES {
+            *output = "... [truncated: total output exceeds 2MB limit]".to_string();
+            *output_limit_hit = true;
+            *total_output_bytes = MAX_TOTAL_OUTPUT_BYTES;
+            return;
+        }
+
+        *total_output_bytes += output.len();
+    }
+
+    fn render_report_payload(
+        &self,
+        report: &ExecutionReport,
+        response_format: ResponseFormat,
+    ) -> String {
+        match response_format {
+            ResponseFormat::Text => self.render_text_report(report),
+            ResponseFormat::Json => serde_json::to_string_pretty(report).unwrap_or_else(|e| {
+                format!("{{\"ok\":false,\"error\":\"json serialization failed: {e}\"}}")
+            }),
+        }
+    }
+
+    fn render_error_payload(
+        &self,
+        message: &str,
+        dry_run: bool,
+        response_format: ResponseFormat,
+    ) -> String {
+        match response_format {
+            ResponseFormat::Text => format!("PATCH ERROR: {message}"),
+            ResponseFormat::Json => serde_json::to_string_pretty(&serde_json::json!({
+                "ok": false,
+                "dry_run": dry_run,
+                "committed": false,
+                "error": { "message": message },
+            }))
+            .unwrap_or_else(|_| {
+                format!("{{\"ok\":false,\"error\":{{\"message\":\"{message}\"}}}}")
+            }),
+        }
+    }
+
+    fn render_text_report(&self, report: &ExecutionReport) -> String {
+        let mut lines = Vec::new();
+
+        if report.dry_run && report.summary.total_operations > 0 {
+            lines.push("DRY RUN: preview only; no filesystem changes were committed.".to_string());
+        }
+
+        if report.summary.total_operations > 0 {
+            lines.push(summary_line(&report.summary, report.ok));
+        }
+
+        for op in &report.operations {
+            if let Some(section) = format_operation_text(op) {
+                lines.push(section);
+            }
+        }
+
+        if lines.is_empty() {
+            "No operations performed.".to_string()
+        } else {
+            lines.join("\n")
+        }
     }
 
     async fn execute_map(
         &self,
-        base_dir: &std::path::Path,
+        session: &PatchSession,
         rel_path: &str,
         max_depth: Option<usize>,
         output_limit: Option<usize>,
     ) -> Result<String, String> {
         use tokio::time::{Duration, timeout};
 
-        const DEFAULT_DEPTH: usize = 3;
-        const DEFAULT_LIMIT: usize = 6000;
-
-        let max_depth = max_depth.unwrap_or(DEFAULT_DEPTH);
-        let output_limit = output_limit.unwrap_or(DEFAULT_LIMIT);
-        let resolved: ResolvedPath = resolve_path(base_dir, rel_path);
+        let max_depth = max_depth.unwrap_or(tool_contract::DEFAULT_MAP_DEPTH);
+        let output_limit = output_limit.unwrap_or(tool_contract::DEFAULT_MAP_OUTPUT_LIMIT);
+        let (resolved, kind) = session
+            .resolve_virtual_kind(rel_path)
+            .map_err(|e| e.to_string())?;
         let full_path = resolved.full_path;
         let path_source = resolved.source;
 
-        if !full_path.exists() {
-            return Err(
-                applier::file_not_found_error(rel_path, &full_path, path_source).to_string(),
-            );
-        }
-
-        if !full_path.is_dir() {
-            return Err("Path is not a directory".to_string());
+        match kind {
+            VirtualPathKind::Missing => {
+                return Err(
+                    applier::file_not_found_error(rel_path, &full_path, path_source).to_string(),
+                );
+            }
+            VirtualPathKind::File => return Err("Path is not a directory".to_string()),
+            VirtualPathKind::Directory => {}
         }
 
         let map_result = timeout(Duration::from_secs(3), async {
-            self.map_directory_with_metrics(&full_path, max_depth, output_limit, 0)
-                .await
+            self.map_directory_with_metrics(session, &full_path, max_depth, 0)
         })
         .await;
 
@@ -479,128 +594,102 @@ impl WeavePatchServer {
     }
 
     #[allow(clippy::type_complexity)]
-    #[allow(clippy::only_used_in_recursion)]
-    fn map_directory_with_metrics<'a>(
-        &'a self,
-        dir_path: &'a std::path::Path,
+    fn map_directory_with_metrics(
+        &self,
+        session: &PatchSession,
+        dir_path: &std::path::Path,
         max_depth: usize,
-        _output_limit: usize,
         current_depth: usize,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<(Vec<String>, MapMetrics), String>> + Send + 'a,
-        >,
-    > {
-        Box::pin(async move {
-            use tokio::fs;
+    ) -> Result<(Vec<String>, MapMetrics), String> {
+        if current_depth > max_depth {
+            return Ok((vec![], MapMetrics::default()));
+        }
 
-            if current_depth > max_depth {
-                return Ok((vec![], MapMetrics::default()));
+        const SKIP_DIRS: &[&str] = &[
+            "node_modules",
+            ".git",
+            "__pycache__",
+            ".next",
+            "dist",
+            "build",
+            "target",
+            ".venv",
+        ];
+        const SKIP_EXTENSIONS: &[&str] = &[
+            ".png", ".jpg", ".jpeg", ".gif", ".ico", ".woff", ".woff2", ".ttf", ".bin", ".lock",
+            ".pdf", ".zip", ".tar", ".gz", ".svg", ".mp4", ".mp3", ".wav", ".webm",
+        ];
+
+        let dir_name = dir_path.file_name().and_then(|n| n.to_str()).unwrap_or(".");
+        let mut lines: Vec<String> = Vec::new();
+        let mut metrics = MapMetrics {
+            max_depth: current_depth,
+            ..Default::default()
+        };
+        let prefix = "  ".repeat(current_depth);
+        let entries = session
+            .list_virtual_dir(dir_path)
+            .map_err(|e| format!("Cannot read directory: {e}"))?;
+
+        let mut file_count = 0;
+        let mut dir_entries: Vec<(String, bool, std::path::PathBuf)> = Vec::new();
+
+        for entry in entries {
+            if SKIP_DIRS.contains(&entry.name.as_str()) {
+                continue;
             }
 
-            const SKIP_DIRS: &[&str] = &[
-                "node_modules",
-                ".git",
-                "__pycache__",
-                ".next",
-                "dist",
-                "build",
-                "target",
-                ".venv",
-            ];
-            const SKIP_EXTENSIONS: &[&str] = &[
-                ".png", ".jpg", ".jpeg", ".gif", ".ico", ".woff", ".woff2", ".ttf", ".bin",
-                ".lock", ".pdf", ".zip", ".tar", ".gz", ".svg", ".mp4", ".mp3", ".wav", ".webm",
-            ];
-
-            let dir_name = dir_path.file_name().and_then(|n| n.to_str()).unwrap_or(".");
-
-            let mut lines: Vec<String> = Vec::new();
-            let mut metrics = MapMetrics {
-                max_depth: current_depth,
-                ..Default::default()
-            };
-            let prefix = "  ".repeat(current_depth);
-
-            let mut entries = match fs::read_dir(dir_path).await {
-                Ok(entries) => entries,
-                Err(e) => return Err(format!("Cannot read directory: {e}")),
-            };
-
-            let mut file_count = 0;
-            let mut dir_entries: Vec<(String, bool, std::path::PathBuf)> = Vec::new();
-
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let name = entry.file_name().to_string_lossy().to_string();
-                let path = entry.path();
-                let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
-
-                if SKIP_DIRS.contains(&name.as_str()) {
-                    continue;
-                }
-
-                if is_dir {
-                    dir_entries.push((name.clone(), true, path));
-                } else {
-                    let _ext = std::path::Path::new(&name)
-                        .extension()
-                        .and_then(|e| e.to_str())
-                        .unwrap_or("");
-                    if !SKIP_EXTENSIONS.iter().any(|skip| name.ends_with(skip)) {
-                        dir_entries.push((name, false, path));
-                        file_count += 1;
-                    }
-                }
+            if entry.is_dir {
+                dir_entries.push((entry.name.clone(), true, entry.path));
+            } else if !SKIP_EXTENSIONS
+                .iter()
+                .any(|skip| entry.name.ends_with(skip))
+            {
+                dir_entries.push((entry.name, false, entry.path));
+                file_count += 1;
             }
+        }
 
-            dir_entries.sort_by(|a, b| match (a.1, b.1) {
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                _ => a.0.cmp(&b.0),
-            });
+        dir_entries.sort_by(|a, b| match (a.1, b.1) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.0.cmp(&b.0),
+        });
 
-            if current_depth > 0 && current_depth <= 3 {
-                match current_depth {
-                    1 | 2 => lines.push(format!("{}{}/", prefix, dir_name)),
-                    3 => lines.push(format!("{}{}/  ({} files)", prefix, dir_name, file_count)),
-                    _ => {}
-                }
+        if current_depth > 0 && current_depth <= 3 {
+            match current_depth {
+                1 | 2 => lines.push(format!("{}{}/", prefix, dir_name)),
+                3 => lines.push(format!("{}{}/  ({} files)", prefix, dir_name, file_count)),
+                _ => {}
             }
+        }
 
-            for (_name, is_dir, path) in dir_entries {
-                if is_dir {
-                    let (sub_lines, sub_metrics) = self
-                        .map_directory_with_metrics(
-                            &path,
-                            max_depth,
-                            _output_limit,
-                            current_depth + 1,
-                        )
-                        .await?;
-                    lines.extend(sub_lines);
-                    metrics.file_count += sub_metrics.file_count;
-                    metrics.total_lines += sub_metrics.total_lines;
-                    metrics.max_depth = metrics.max_depth.max(sub_metrics.max_depth);
-                } else {
-                    let (file_info, line_count) =
-                        self.describe_file_with_lines(&path, current_depth).await?;
-                    lines.push(file_info);
-                    metrics.file_count += 1;
-                    metrics.total_lines += line_count;
-                }
+        for (_name, is_dir, path) in dir_entries {
+            if is_dir {
+                let (sub_lines, sub_metrics) =
+                    self.map_directory_with_metrics(session, &path, max_depth, current_depth + 1)?;
+                lines.extend(sub_lines);
+                metrics.file_count += sub_metrics.file_count;
+                metrics.total_lines += sub_metrics.total_lines;
+                metrics.max_depth = metrics.max_depth.max(sub_metrics.max_depth);
+            } else {
+                let (file_info, line_count) =
+                    self.describe_file_with_lines(session, &path, current_depth)?;
+                lines.push(file_info);
+                metrics.file_count += 1;
+                metrics.total_lines += line_count;
             }
+        }
 
-            Ok((lines, metrics))
-        })
+        Ok((lines, metrics))
     }
 
-    async fn describe_file_with_lines(
+    fn describe_file_with_lines(
         &self,
+        session: &PatchSession,
         file_path: &std::path::Path,
         current_depth: usize,
     ) -> Result<(String, usize), String> {
-        use tokio::fs;
-
         let file_name = file_path
             .file_name()
             .and_then(|n| n.to_str())
@@ -609,9 +698,10 @@ impl WeavePatchServer {
         let prefix = "  ".repeat(current_depth + 1);
 
         // Read bytes for binary detection
-        let bytes = match fs::read(file_path).await {
-            Ok(b) => b,
+        let bytes = match session.read_virtual_bytes_at(file_path) {
+            Ok(Some((bytes, _))) => bytes,
             Err(_) => return Ok((format!("{}{}  [unreadable]", prefix, file_name), 0)),
+            Ok(None) => return Ok((format!("{}{}  [unreadable]", prefix, file_name), 0)),
         };
 
         // Check for null bytes in first 8KB (binary indicator)
@@ -667,54 +757,6 @@ impl WeavePatchServer {
                 line_count,
             ))
         }
-    }
-
-    async fn read_single_file(
-        &self,
-        base_dir: &Path,
-        rel_path: &str,
-    ) -> Result<(String, PathSource), String> {
-        let resolved: ResolvedPath = resolve_path(base_dir, rel_path);
-        let full_path = resolved.full_path;
-        let path_source = resolved.source;
-
-        if !full_path.exists() {
-            return Err(
-                applier::file_not_found_error(rel_path, &full_path, path_source).to_string(),
-            );
-        }
-
-        let meta = tokio::fs::symlink_metadata(&full_path)
-            .await
-            .map_err(|e| format!("IO error: {e}"))?;
-
-        if meta.file_type().is_symlink() {
-            return Err("Symlink rejected".to_string());
-        }
-
-        if !meta.is_file() {
-            return Err("Not a regular file".to_string());
-        }
-
-        // Binary detection: read bytes first
-        let bytes = tokio::fs::read(&full_path)
-            .await
-            .map_err(|e| format!("Read error: {e}"))?;
-
-        // Check for null bytes in first 8KB (binary indicator)
-        const CHECK_SIZE: usize = 8192;
-        let check_len = std::cmp::min(bytes.len(), CHECK_SIZE);
-        if bytes[..check_len].contains(&0) {
-            return Ok((
-                "[binary file - content not displayed]".to_string(),
-                path_source,
-            ));
-        }
-
-        // Convert to string, handling UTF-8 errors gracefully
-        String::from_utf8(bytes)
-            .map(|s| (s, path_source))
-            .map_err(|e| format!("UTF-8 decode error: {e}"))
     }
 }
 
@@ -887,22 +929,182 @@ fn infer_language(path: &str) -> String {
     }
 }
 
+fn is_mutating_result(op: &OpResult) -> bool {
+    matches!(
+        op.op_type.as_str(),
+        "add" | "write" | "update" | "delete" | "move"
+    )
+}
+
+fn build_summary(operations: &[OpResult]) -> ExecutionSummary {
+    ExecutionSummary {
+        total_operations: operations.len(),
+        ok_operations: operations
+            .iter()
+            .filter(|op| op.status == OpStatus::Ok)
+            .count(),
+        skipped_operations: operations
+            .iter()
+            .filter(|op| op.status == OpStatus::Skipped)
+            .count(),
+        error_operations: operations
+            .iter()
+            .filter(|op| matches!(op.status, OpStatus::FatalError | OpStatus::RecoverableError))
+            .count(),
+        add_operations: operations.iter().filter(|op| op.op_type == "add").count(),
+        write_operations: operations.iter().filter(|op| op.op_type == "write").count(),
+        update_operations: operations
+            .iter()
+            .filter(|op| op.op_type == "update")
+            .count(),
+        delete_operations: operations
+            .iter()
+            .filter(|op| op.op_type == "delete")
+            .count(),
+        move_operations: operations.iter().filter(|op| op.op_type == "move").count(),
+        read_operations: operations.iter().filter(|op| op.op_type == "read").count(),
+        map_operations: operations.iter().filter(|op| op.op_type == "map").count(),
+    }
+}
+
+fn summary_line(summary: &ExecutionSummary, ok: bool) -> String {
+    let mut parts = Vec::new();
+
+    if summary.add_operations > 0 {
+        parts.push(format!("{} created", summary.add_operations));
+    }
+    if summary.write_operations > 0 {
+        parts.push(format!("{} written", summary.write_operations));
+    }
+    if summary.update_operations > 0 {
+        parts.push(format!("{} updated", summary.update_operations));
+    }
+    if summary.delete_operations > 0 {
+        parts.push(format!("{} deleted", summary.delete_operations));
+    }
+    if summary.move_operations > 0 {
+        parts.push(format!("{} moved", summary.move_operations));
+    }
+    if summary.read_operations > 0 {
+        parts.push(format!("{} read", summary.read_operations));
+    }
+    if summary.map_operations > 0 {
+        parts.push(format!("{} mapped", summary.map_operations));
+    }
+
+    let prefix = if ok { "✓" } else { "!" };
+    if parts.is_empty() {
+        format!("{prefix} {} operations processed", summary.total_operations)
+    } else {
+        format!(
+            "{prefix} {} operations processed ({})",
+            summary.total_operations,
+            parts.join(", ")
+        )
+    }
+}
+
+fn format_operation_text(op: &OpResult) -> Option<String> {
+    if matches!(op.status, OpStatus::FatalError | OpStatus::RecoverableError) {
+        let base = format!("[ERROR] {} — {}: {}", op.op_type, op.path, op.message);
+        return Some(if let Some(ref llm_json) = op.llm_error {
+            format!("{}\n```json\n{}\n```", base, llm_json)
+        } else {
+            base
+        });
+    }
+
+    if let Some(ref output) = op.output {
+        return Some(output.clone());
+    }
+
+    let prefix = match op.status {
+        OpStatus::Skipped => "○",
+        OpStatus::ValidationWarning => "!",
+        _ => "✓",
+    };
+
+    let warn_suffix = if op.warnings.is_empty() {
+        String::new()
+    } else {
+        format!(" [warnings: {}]", op.warnings.join("; "))
+    };
+    let batch_suffix = format_batch(&op.batch_index, &op.batch_total);
+    let mut lines = Vec::new();
+
+    let header = match op.op_type.as_str() {
+        "update" | "write" => {
+            if let Some((before, after)) = op.line_changes {
+                format!(
+                    "{} {} — {} ({} → {} lines){}{}",
+                    prefix, op.op_type, op.path, before, after, warn_suffix, batch_suffix
+                )
+            } else {
+                format!(
+                    "{} {} — {}{}{}",
+                    prefix, op.op_type, op.path, warn_suffix, batch_suffix
+                )
+            }
+        }
+        "add" => {
+            if let Some((_, after)) = op.line_changes {
+                format!(
+                    "{} {} — {} ({} lines){}{}",
+                    prefix, op.op_type, op.path, after, warn_suffix, batch_suffix
+                )
+            } else {
+                format!(
+                    "{} {} — {}{}{}",
+                    prefix, op.op_type, op.path, warn_suffix, batch_suffix
+                )
+            }
+        }
+        "delete" => format!(
+            "{} {} — {} ({}){}{}",
+            prefix, op.op_type, op.path, op.message, warn_suffix, batch_suffix
+        ),
+        _ => format!(
+            "{} {} — {}{}{}",
+            prefix, op.op_type, op.path, warn_suffix, batch_suffix
+        ),
+    };
+
+    lines.push(header);
+
+    if let Some(ref rollback_reason) = op.rollback_reason {
+        lines.push(format!("  {rollback_reason}"));
+    }
+
+    if let Some(ref match_info) = op.match_info
+        && op.op_type == "update"
+    {
+        if match_info.contains("; ") {
+            for (idx, part) in match_info.split("; ").enumerate() {
+                lines.push(format!("  Hunk {}: {}", idx + 1, part.trim()));
+            }
+        } else {
+            lines.push(format!("  {match_info}"));
+        }
+    }
+
+    if let Some(ref diff) = op.diff {
+        let diff_lines: Vec<&str> = diff.lines().collect();
+        for diff_line in diff_lines.iter().take(5) {
+            lines.push(format!("   {diff_line}"));
+        }
+        if diff_lines.len() > 5 {
+            lines.push(format!("   ... (+{} more lines)", diff_lines.len() - 5));
+        }
+    }
+
+    Some(lines.join("\n"))
+}
+
 #[tool_handler]
 impl ServerHandler for WeavePatchServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(
-            ServerCapabilities::builder()
-                .enable_tools()
-                .build(),
-        )
-        .with_instructions(
-            "Structured file patching MCP server. One tool: patch__exec.\n\n\
-             Migration-friendly format: view/read, map, create, write, update, move, delete in === begin / === end.\n\n\
-             View/read: view|read <path> [symbols=a,b] [language=rust] [offset=0] [limit=100] [start=1] [end=20]\n\n\
-             Create/write: create|write <path> followed by raw text or apply_patch-style + lines.\n\n\
-             Security: no symlinks. Relative paths (including ../), absolute paths, and ~ home expansion are allowed.\n\n\
-             Validators: rustfmt, gofmt, py_compile, json.tool, bash -n, node --check, terraform fmt (advisory)."
-        )
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_instructions(tool_contract::server_instructions())
     }
 }
 
@@ -911,4 +1113,139 @@ pub async fn run() -> anyhow::Result<()> {
     service.waiting().await?;
     Ok(())
 }
-use crate::applier::OpStatus;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn tmp() -> TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    fn params(patch: &str) -> BatchExecParams {
+        BatchExecParams {
+            patch: patch.to_string(),
+            threshold: None,
+            dry_run: false,
+            response_format: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn write_then_read_sees_staged_content_and_commits() {
+        let dir = tmp();
+        fs::write(dir.path().join("demo.txt"), "old\n").unwrap();
+        let server = WeavePatchServer::new();
+        let params = params("=== begin\nwrite demo.txt\nnew\nread demo.txt\n=== end");
+
+        let report = server.execute_batch_at(dir.path(), &params).await.unwrap();
+
+        assert!(report.ok);
+        assert!(report.committed);
+        assert_eq!(report.summary.write_operations, 1);
+        assert_eq!(report.summary.read_operations, 1);
+        assert_eq!(report.operations[0].status, OpStatus::Ok);
+        assert_eq!(report.operations[1].status, OpStatus::Ok);
+        assert!(
+            report.operations[1]
+                .output
+                .as_deref()
+                .unwrap()
+                .contains("[staged]")
+        );
+        assert!(
+            report.operations[1]
+                .output
+                .as_deref()
+                .unwrap()
+                .contains("\nnew")
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("demo.txt")).unwrap(),
+            "new\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_preserves_filesystem_but_reads_staged_content() {
+        let dir = tmp();
+        fs::write(dir.path().join("preview.txt"), "old\n").unwrap();
+        let server = WeavePatchServer::new();
+        let mut params = params("=== begin\nwrite preview.txt\npreview\nread preview.txt\n=== end");
+        params.dry_run = true;
+
+        let report = server.execute_batch_at(dir.path(), &params).await.unwrap();
+
+        assert!(report.ok);
+        assert!(!report.committed);
+        assert!(report.dry_run);
+        assert_eq!(report.operations[0].status, OpStatus::Ok);
+        assert_eq!(
+            report.operations[0].rollback_reason.as_deref(),
+            Some("Dry run: preview only; no filesystem changes committed")
+        );
+        assert!(
+            report.operations[1]
+                .output
+                .as_deref()
+                .unwrap()
+                .contains("[staged]")
+        );
+        assert!(
+            report.operations[1]
+                .output
+                .as_deref()
+                .unwrap()
+                .contains("\npreview")
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("preview.txt")).unwrap(),
+            "old\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn json_response_payload_includes_summary_and_operations() {
+        let dir = tmp();
+        let server = WeavePatchServer::new();
+        let mut params = params("=== begin\nwrite report.txt\nhello\n=== end");
+        params.response_format = Some(ResponseFormat::Json);
+
+        let report = server.execute_batch_at(dir.path(), &params).await.unwrap();
+        let payload = server.render_report_payload(&report, ResponseFormat::Json);
+        let json: serde_json::Value = serde_json::from_str(&payload).unwrap();
+
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["dry_run"], false);
+        assert_eq!(json["committed"], true);
+        assert_eq!(json["summary"]["total_operations"], 1);
+        assert_eq!(json["summary"]["write_operations"], 1);
+        assert_eq!(json["operations"][0]["op_type"], "write");
+        assert_eq!(json["operations"][0]["status"], "ok");
+    }
+
+    #[test]
+    fn tool_contract_docs_are_synchronized() {
+        let readme = include_str!("../README.md");
+        let instructions = tool_contract::server_instructions();
+
+        assert!(
+            tool_contract::PATCH_EXEC_DESCRIPTION
+                .contains(&format!("Version: {}", tool_contract::VERSION))
+        );
+        assert!(readme.contains(&format!("version-{}", tool_contract::VERSION)));
+        assert!(readme.contains(&tool_contract::readme_defaults_line()));
+        assert!(readme.contains("dry_run"));
+        assert!(readme.contains("response_format=json"));
+        assert!(instructions.contains("dry_run"));
+        assert!(instructions.contains("response_format=json"));
+        assert!(instructions.contains(&format!(
+            "map depth={}, map limit={} chars, read truncation={} lines",
+            tool_contract::DEFAULT_MAP_DEPTH,
+            tool_contract::DEFAULT_MAP_OUTPUT_LIMIT,
+            tool_contract::DEFAULT_READ_LINE_LIMIT
+        )));
+    }
+}
