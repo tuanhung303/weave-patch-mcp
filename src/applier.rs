@@ -37,7 +37,7 @@ pub struct ResolvedPath {
 
 /// Default fuzzy matching threshold (97% similarity required).
 /// Higher threshold reduces false positives in context matching.
-pub const FUZZY_THRESHOLD: f32 = 0.97;
+pub const FUZZY_THRESHOLD: f32 = 0.95;
 
 /// Semantic status for operation results.
 /// Enables programmatic handling of outcomes beyond string matching.
@@ -93,7 +93,7 @@ pub struct HunkResult {
 }
 
 #[derive(Debug)]
-pub struct PatchResult {
+pub struct PatchOutcome {
     pub operations: Vec<OpResult>,
 }
 
@@ -662,7 +662,7 @@ fn make_skipped_op_from_file_op(
 }
 
 #[must_use]
-pub fn weave_patch(ops: Vec<FileOp>, base_dir: &Path) -> PatchResult {
+pub fn weave_patch(ops: Vec<FileOp>, base_dir: &Path) -> PatchOutcome {
     weave_patch_with_threshold(ops, base_dir, None)
 }
 
@@ -671,13 +671,13 @@ pub fn weave_patch(ops: Vec<FileOp>, base_dir: &Path) -> PatchResult {
 /// # Arguments
 /// * `ops` - Vector of file operations to apply
 /// * `base_dir` - Base directory for resolving relative paths
-/// * `threshold` - Optional fuzzy matching threshold (0.0-1.0). Defaults to FUZZY_THRESHOLD (0.97) if None.
+/// * `threshold` - Optional fuzzy matching threshold (0.0-1.0). Defaults to FUZZY_THRESHOLD (0.95) if None.
 #[must_use]
 pub fn weave_patch_with_threshold(
     ops: Vec<FileOp>,
     base_dir: &Path,
     threshold: Option<f32>,
-) -> PatchResult {
+) -> PatchOutcome {
     let mut session = PatchSession::new(base_dir, threshold);
     let total = ops.len();
     let mut results: Vec<OpResult> = Vec::with_capacity(total);
@@ -716,7 +716,7 @@ pub fn weave_patch_with_threshold(
                 r.rollback_reason = Some(message.clone());
             }
         }
-        return PatchResult {
+        return PatchOutcome {
             operations: results,
         };
     }
@@ -732,7 +732,7 @@ pub fn weave_patch_with_threshold(
         }
     }
 
-    PatchResult {
+    PatchOutcome {
         operations: results,
     }
 }
@@ -2558,7 +2558,7 @@ mod tests {
             move_to: None,
         }];
         // Use 0.85 threshold to match original fuzzy behavior
-        // With 0.97 default, this would fail due to low similarity
+        // With 0.95 default, this would fail due to low similarity
         let result = weave_patch_with_threshold(ops, dir.path(), Some(0.85));
         assert_eq!(
             result.operations[0].status,
@@ -2609,7 +2609,7 @@ mod tests {
             move_to: None,
         }];
         // Use 0.85 threshold for fuzzy match with slight differences
-        // With 0.97 default, this would fail (similarity ~95%)
+        // With 0.95 default, this would fail (similarity ~95%)
         let result = weave_patch_with_threshold(ops, dir.path(), Some(0.85));
         assert_eq!(
             result.operations[0].status,

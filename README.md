@@ -1,6 +1,6 @@
 # weave-patch-mcp
 
-[![version](https://img.shields.io/badge/version-0.0.16-blue)](https://www.npmjs.com/package/mcp-weave-patch) [![license](https://img.shields.io/badge/license-MIT-green)](https://opensource.org/licenses/MIT) [![platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)](#supported-platforms)
+[![version](https://img.shields.io/badge/version-0.0.17-blue)](https://www.npmjs.com/package/mcp-weave-patch) [![license](https://img.shields.io/badge/license-MIT-green)](https://opensource.org/licenses/MIT) [![platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)](#supported-platforms)
 
 **One tool. Familiar view/write flows. Zero intermediate states.**
 
@@ -444,6 +444,32 @@ cargo test
 | `src/parser.rs` (unit) | Compact syntax patch parsing, auto-wrap missing markers, multi-file, hints, Read/Map specs |
 | `src/applier.rs` (unit) | Path validation, fuzzy matching, validators, diff generation, match info |
 | `src/reader.rs` (unit) | Line ranges, symbol extraction (Rust/Python/TS/Go), glob expansion |
+
+## Programmatic API
+
+The `tool_contract` module exposes version and package information for external tools that need to detect or display weave-patch-mcp capabilities.
+
+### `get_version_info()`
+
+Returns a `VersionInfo` struct containing version and build metadata:
+
+```rust
+use weave_patch_mcp::tool_contract::{get_version_info, VersionInfo};
+
+let info: VersionInfo = get_version_info();
+println!("Name: {}", info.name);            // "weave-patch-mcp"
+println!("Version: {}", info.version);      // e.g., "0.0.17"
+println!("Repo: {}", info.repository);      // "https://github.com/..."
+```
+
+**Fields:**
+
+| Field | Description |
+|-------|-------------|
+| `name` | Crate name from `CARGO_PKG_NAME` |
+| `version` | Crate version from `CARGO_PKG_VERSION` |
+| `description` | Crate description from `CARGO_PKG_DESCRIPTION` |
+| `repository` | Repository URL from `CARGO_PKG_REPOSITORY` |
 
 ## License
 

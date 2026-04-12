@@ -771,7 +771,7 @@ fn test_conflict_add_update_same_path() {
 // FUZZY THRESHOLD TESTS
 // ============================================================================
 
-/// Test: Default threshold (0.97) rejects low-similarity matches
+/// Test: Default threshold (0.95) rejects low-similarity matches
 #[test]
 fn test_threshold_default_rejects_low_similarity() {
     let dir = tmp();
@@ -797,7 +797,7 @@ fn test_threshold_default_rejects_low_similarity() {
     // Should fail because similarity is below 97%
     assert!(
         result.operations[0].status == OpStatus::RecoverableError,
-        "Should reject low-similarity match with 0.97 threshold"
+        "Should reject low-similarity match with 0.95 threshold"
     );
 }
 
@@ -879,10 +879,10 @@ fn test_threshold_1_0_requires_exact() {
 fn test_threshold_default_matches_constant() {
     use weave_patch_mcp::applier::FUZZY_THRESHOLD;
 
-    // Verify the constant is 0.97
+    // Verify the constant is 0.95
     assert!(
-        (FUZZY_THRESHOLD - 0.97).abs() < 0.01,
-        "FUZZY_THRESHOLD should be 0.97, got {}",
+        (FUZZY_THRESHOLD - 0.95).abs() < 0.01,
+        "FUZZY_THRESHOLD should be 0.95, got {}",
         FUZZY_THRESHOLD
     );
 }

@@ -1,5 +1,5 @@
 Unified workspace tool for agents moving from Copilot CLI `view` + `apply_patch`: `view`/`read`, `map`, `create`, `write`, `update`, `move`, and `delete` in one atomic call.
-Version: 0.0.16
+Version: 0.0.17
 
 FORMAT: use weave syntax wrapped in === begin / === end, or paste native apply_patch blocks directly.
 
@@ -110,7 +110,7 @@ TOOL PARAMETERS:
   - response_format=json returns a machine-readable JSON payload in the tool text response
 
 DEFAULTS:
-  - Fuzzy matching threshold: 0.97
+  - Fuzzy matching threshold: 0.95
   - Map depth: 3, output limit: 6000 chars
   - File read truncation: 1000 lines unless symbols/limit/start-end specified
 

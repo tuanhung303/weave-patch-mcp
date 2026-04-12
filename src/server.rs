@@ -25,7 +25,7 @@ pub struct BatchExecParams {
     pub patch: String,
 
     #[schemars(
-        description = "Optional fuzzy matching threshold (0.0-1.0). Higher values (e.g., 0.97) require stricter matching. Default: 0.97."
+        description = "Optional fuzzy matching threshold (0.0-1.0). Higher values (e.g., 0.97) require stricter matching. Default: 0.95."
     )]
     pub threshold: Option<f32>,
 
